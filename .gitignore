@@ -15,3 +15,7 @@ export_presets.cfg
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Caches Python des scripts de demonstration
+__pycache__/
+*.pyc
