@@ -38,7 +38,21 @@ pub(crate) fn apply(connection: &Connection) -> rusqlite::Result<()> {
              current_health INTEGER NOT NULL,
              x              INTEGER NOT NULL,
              y              INTEGER NOT NULL,
+             -- 0 signale un emplacement vide : aucun objet ne porte cet
+             -- identifiant, la colonne n'a donc pas besoin d'etre nullable.
+             weapon         INTEGER NOT NULL DEFAULT 0,
+             armor          INTEGER NOT NULL DEFAULT 0,
              updated_at     INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+
+         -- Une ligne par objet porte, plutot qu'une colonne par emplacement :
+         -- agrandir le sac ne demandera pas de migration de schema.
+         CREATE TABLE IF NOT EXISTS inventory_items (
+             account_id INTEGER NOT NULL
+                        REFERENCES accounts(id) ON DELETE CASCADE,
+             slot_index INTEGER NOT NULL,
+             item_id    INTEGER NOT NULL,
+             PRIMARY KEY (account_id, slot_index)
          );",
     )
 }

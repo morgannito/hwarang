@@ -50,6 +50,21 @@ personnage neuf se fait submerger sans avoir rien fait de maladroit — constat�
 en jouant la démonstration, pas en relisant le code.
 **Démo :** `scripts/creatures.py`
 
+### J6 — Objets
+Catalogue, sac à emplacements stables, équipement, butin. Les définitions sont
+une **donnée** passée au monde : rééquilibrer une arme ne demande pas de
+recompiler, et les bonus étant relus au calcul plutôt que recopiés à
+l'équipement, le rééquilibrage s'applique aux objets déjà portés.
+
+Le sac ne se tasse pas quand on en retire un objet : un client qui affiche une
+grille verrait sinon son contenu se réorganiser sous le curseur.
+
+**Régénération hors combat**, ajoutée ici parce que la démonstration l'a rendue
+inévitable : sans elle, les dégâts s'accumulent d'un combat au suivant et le seul
+moyen de repartir en pleine santé est de mourir. Constaté en enchaînant deux
+adversaires, pas en relisant le code.
+**Démo :** `scripts/items.py`, en deux phases autour d'un redémarrage.
+
 ---
 
 ## Phase 1 — Faire du serveur un jeu
@@ -70,11 +85,6 @@ voit ; un client bricolé pour tricher se fait replacer visiblement.
 
 **Inconnue non levée :** lire du binaire big-endian depuis GDScript
 (`PackedByteArray`, lectures partielles). Non vérifié à ce jour.
-
-### J6 — Objets · **grand**
-
-Inventaire, équipement, statistiques dérivées de l'équipement, butin.
-C'est le premier jalon dont le coût est autant en **données** qu'en code.
 
 ---
 
@@ -115,7 +125,7 @@ image. Tout ce qui vient après ajoute de la matière, pas des fondations.
 
 | Sujet | État |
 |---|---|
-| Dépôt public ou privé | privé ; la CI Actions est bloquée côté facturation, le passage en public la débloquerait (et l'ADR-0001 le permet) |
+| Dépôt public ou privé | **public** depuis le 08/08/2026 ; la CI Actions fonctionne (gratuite et illimitée en public) |
 | Origine des assets | non tranchée — à décider avant J3 |
 | Base de données | SQLite en place ; PostgreSQL si la charge le justifie, le domaine n'en dépend pas |
 | Chiffrement du transport | absent ; à traiter avant toute exposition hors réseau local |

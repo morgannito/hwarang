@@ -1,5 +1,9 @@
 //! Agregat personnage : identite, attributs, progression.
 
+mod regeneration;
+
+pub use regeneration::RegenerationRule;
+
 use crate::shared::{Experience, Level, ProgressionCurve, Vitals};
 
 /// Identifiant opaque, attribue par la couche de persistance.
@@ -224,6 +228,18 @@ impl Character {
         }
     }
 
+    /// Rend des points de vie, sans depasser le maximum.
+    ///
+    /// Sans effet sur un personnage a terre : revenir en jeu est une decision du
+    /// joueur, pas une consequence du temps qui passe.
+    #[must_use]
+    pub fn regenerate(self, amount: u32) -> Self {
+        Self {
+            vitals: self.vitals.healed_by(amount),
+            ..self
+        }
+    }
+
     /// Remet le personnage en jeu, jauges pleines.
     ///
     /// Ni palier ni experience ne sont retires : une penalite de mort est une
@@ -334,6 +350,23 @@ mod tests {
         assert!(grown.level() > wounded.level());
         assert!((ratio_before - ratio_after).abs() < 0.01);
         assert!(grown.vitals().max() > wounded.vitals().max());
+    }
+
+    #[test]
+    fn la_regeneration_rend_des_points_sans_depasser_le_maximum() {
+        let wounded = hero().take_damage(100);
+        let healed = wounded.regenerate(40);
+        assert_eq!(healed.vitals().current(), wounded.vitals().current() + 40);
+
+        let overhealed = wounded.regenerate(u32::MAX);
+        assert_eq!(overhealed.vitals().current(), overhealed.vitals().max());
+    }
+
+    #[test]
+    fn la_regeneration_ne_releve_pas_un_mort() {
+        // Revenir en jeu est une decision du joueur, pas un effet du temps.
+        let dead = hero().take_damage(u32::MAX);
+        assert!(!dead.regenerate(u32::MAX).is_alive());
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub enum WorldCommand {
     Move { x: i32, y: i32 },
     Attack { target: u64 },
     Respawn,
+    Equip { slot_index: u16 },
+    Unequip { slot: u8 },
 }
 
 /// Action a executer sur le stockage des comptes.
@@ -161,6 +163,12 @@ impl Session {
             (State::InWorld { .. }, ClientMessage::Respawn) => {
                 Reaction::Perform(WorldCommand::Respawn)
             }
+            (State::InWorld { .. }, ClientMessage::EquipItem { slot_index }) => {
+                Reaction::Perform(WorldCommand::Equip { slot_index })
+            }
+            (State::InWorld { .. }, ClientMessage::UnequipItem { slot }) => {
+                Reaction::Perform(WorldCommand::Unequip { slot })
+            }
 
             // Reste : trame avant le handshake, action avant authentification,
             // deplacement avant l'entree dans le monde, seconde entree.
@@ -237,6 +245,8 @@ mod tests {
             ClientMessage::Move { x: 0, y: 0 },
             ClientMessage::Attack { target: 1 },
             ClientMessage::Respawn,
+            ClientMessage::EquipItem { slot_index: 0 },
+            ClientMessage::UnequipItem { slot: 1 },
             login(),
         ] {
             let mut session = Session::new(7);
@@ -294,6 +304,7 @@ mod tests {
             ClientMessage::Move { x: 1, y: 1 },
             ClientMessage::Attack { target: 2 },
             ClientMessage::Respawn,
+            ClientMessage::EquipItem { slot_index: 0 },
         ] {
             let mut session = awaiting_auth();
             assert_eq!(
@@ -379,6 +390,14 @@ mod tests {
         assert_eq!(
             session.on_message(ClientMessage::Respawn),
             Reaction::Perform(WorldCommand::Respawn)
+        );
+        assert_eq!(
+            session.on_message(ClientMessage::EquipItem { slot_index: 3 }),
+            Reaction::Perform(WorldCommand::Equip { slot_index: 3 })
+        );
+        assert_eq!(
+            session.on_message(ClientMessage::UnequipItem { slot: 2 }),
+            Reaction::Perform(WorldCommand::Unequip { slot: 2 })
         );
     }
 }

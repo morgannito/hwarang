@@ -14,7 +14,7 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -35,7 +35,7 @@ jobs:
     name: protocole bout en bout
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -89,26 +89,33 @@ jobs:
           run_demo combat.py 13003
           run_demo creatures.py 13005
 
-          # La persistance demande deux serveurs successifs sur la MEME base :
-          # c'est tout l'objet du test, il ne peut pas passer par `run_demo`.
-          echo "--- persistence.py ---"
-          db="$(mktemp -d)/hwarang.sqlite"
-          for phase in phase1 phase2; do
-            HWARANG_DB="$db" HWARANG_BIND=127.0.0.1:13004 \
-              ./target/release/hwarang-server &
-            pid=$!
-            python3 - <<'WAIT'
+          # Ces deux scenarios demandent deux serveurs successifs sur la MEME
+          # base : c'est tout leur objet, ils ne peuvent pas passer par `run_demo`.
+          run_two_phase() {
+            local script="$1" port="$2" db
+            echo "--- $script ---"
+            db="$(mktemp -d)/hwarang.sqlite"
+            for phase in phase1 phase2; do
+              HWARANG_DB="$db" HWARANG_BIND="127.0.0.1:$port" \
+                ./target/release/hwarang-server &
+              local pid=$!
+              python3 - "$port" <<'WAIT'
           import socket, sys, time
+          port = int(sys.argv[1])
           deadline = time.monotonic() + 15
           while time.monotonic() < deadline:
               try:
-                  socket.create_connection(("127.0.0.1", 13004), timeout=1).close()
+                  socket.create_connection(("127.0.0.1", port), timeout=1).close()
                   sys.exit(0)
               except OSError:
                   time.sleep(0.2)
           sys.exit("le serveur n'a pas ouvert le port")
           WAIT
-            python3 scripts/persistence.py 127.0.0.1 13004 "$phase"
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-          done
+              python3 "scripts/$script" 127.0.0.1 "$port" "$phase"
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+            done
+          }
+
+          run_two_phase persistence.py 13004
+          run_two_phase items.py 13006

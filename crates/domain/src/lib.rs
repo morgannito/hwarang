@@ -7,14 +7,16 @@
 pub mod ai;
 pub mod character;
 pub mod combat;
+pub mod item;
 pub mod shared;
 pub mod world;
 
 pub use ai::{AggroRule, Intent, Situation, Stance, Threat};
-pub use character::{Attributes, Character, CharacterId, ProgressionOutcome};
+pub use character::{Attributes, Character, CharacterId, ProgressionOutcome, RegenerationRule};
 pub use combat::{
     AttackProfile, AttackRejection, CombatRule, DefenseProfile, Engagement, Resistance,
     experience_reward, resolve_attack,
 };
+pub use item::{Catalog, Equipment, Inventory, InventoryError, ItemDefinition, ItemId, Slot};
 pub use shared::{Experience, Level, ProgressionCurve, Vitals};
 pub use world::{CellCoord, Grid, MoveVerdict, MovementRule, MovementSpeed, Position};

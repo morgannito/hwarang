@@ -14,7 +14,7 @@ use codec::{Reader, Writer};
 /// Version du protocole. Toute rupture de format incremente cette valeur, ce
 /// qui permet au serveur de refuser proprement un client desynchronise plutot
 /// que de mal interpreter ses octets.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Longueur maximale d'un nom de compte, en octets UTF-8.
 pub const MAX_USERNAME_LEN: usize = 32;
@@ -84,6 +84,10 @@ pub enum ClientMessage {
     Attack { target: EntityId },
     /// Demande de retour en jeu apres une mort.
     Respawn,
+    /// Equipe l'objet range a cet emplacement du sac.
+    EquipItem { slot_index: u16 },
+    /// Retire l'objet equipe a cet emplacement (1 = arme, 2 = armure).
+    UnequipItem { slot: u8 },
 }
 
 /// Motif de refus d'une attaque, transmis au client.
@@ -256,6 +260,21 @@ pub enum ServerMessage {
         amount: u64,
         level: u8,
     },
+    /// Un objet vient d'entrer dans le sac.
+    ItemReceived {
+        item: u32,
+        slot_index: u16,
+    },
+    /// Le sac est plein : l'objet a ete perdu, ou l'operation refusee.
+    InventoryFull,
+    /// L'equipement a change. `item` vaut 0 pour un emplacement vide.
+    EquipmentChanged {
+        slot: u8,
+        item: u32,
+    },
+    /// L'objet ne peut pas etre equipe : inconnu, mauvais emplacement, palier
+    /// insuffisant, ou emplacement de sac vide.
+    EquipRefused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +298,8 @@ mod opcode {
     pub const RESPAWN: u8 = 0x06;
     pub const REGISTER: u8 = 0x07;
     pub const LOGIN: u8 = 0x08;
+    pub const EQUIP_ITEM: u8 = 0x09;
+    pub const UNEQUIP_ITEM: u8 = 0x0A;
 
     pub const HANDSHAKE_ACCEPTED: u8 = 0x81;
     pub const HANDSHAKE_REJECTED: u8 = 0x82;
@@ -295,6 +316,10 @@ mod opcode {
     pub const EXPERIENCE_GAINED: u8 = 0x8D;
     pub const AUTHENTICATED: u8 = 0x8E;
     pub const AUTH_REFUSED: u8 = 0x8F;
+    pub const ITEM_RECEIVED: u8 = 0x90;
+    pub const INVENTORY_FULL: u8 = 0x91;
+    pub const EQUIPMENT_CHANGED: u8 = 0x92;
+    pub const EQUIP_REFUSED: u8 = 0x93;
 }
 
 /// Isole une trame du flux : retourne `(opcode, charge utile, octets consommes)`.
@@ -401,6 +426,14 @@ impl ClientMessage {
                 frame(opcode::ATTACK, &Writer::default().u64(*target).into_bytes())
             }
             Self::Respawn => frame(opcode::RESPAWN, &[]),
+            Self::EquipItem { slot_index } => frame(
+                opcode::EQUIP_ITEM,
+                &Writer::default().u16(*slot_index).into_bytes(),
+            ),
+            Self::UnequipItem { slot } => frame(
+                opcode::UNEQUIP_ITEM,
+                &Writer::default().u8(*slot).into_bytes(),
+            ),
         }
     }
 
@@ -449,6 +482,18 @@ impl ClientMessage {
             opcode::RESPAWN => {
                 Reader::new(payload).finish()?;
                 Self::Respawn
+            }
+            opcode::EQUIP_ITEM => {
+                let mut reader = Reader::new(payload);
+                let slot_index = reader.u16()?;
+                reader.finish()?;
+                Self::EquipItem { slot_index }
+            }
+            opcode::UNEQUIP_ITEM => {
+                let mut reader = Reader::new(payload);
+                let slot = reader.u8()?;
+                reader.finish()?;
+                Self::UnequipItem { slot }
             }
             other => return Err(DecodeError::UnknownOpcode(other)),
         };
@@ -545,6 +590,16 @@ impl ServerMessage {
                 opcode::AUTH_REFUSED,
                 &Writer::default().u8(reason.code()).into_bytes(),
             ),
+            Self::ItemReceived { item, slot_index } => frame(
+                opcode::ITEM_RECEIVED,
+                &Writer::default().u32(item).u16(slot_index).into_bytes(),
+            ),
+            Self::InventoryFull => frame(opcode::INVENTORY_FULL, &[]),
+            Self::EquipmentChanged { slot, item } => frame(
+                opcode::EQUIPMENT_CHANGED,
+                &Writer::default().u8(slot).u32(item).into_bytes(),
+            ),
+            Self::EquipRefused => frame(opcode::EQUIP_REFUSED, &[]),
         }
     }
 
@@ -673,6 +728,28 @@ impl ServerMessage {
                     reason: AuthRefusal::from_code(code).ok_or(DecodeError::MalformedPayload)?,
                 }
             }
+            opcode::ITEM_RECEIVED => {
+                let mut reader = Reader::new(payload);
+                let item = reader.u32()?;
+                let slot_index = reader.u16()?;
+                reader.finish()?;
+                Self::ItemReceived { item, slot_index }
+            }
+            opcode::INVENTORY_FULL => {
+                Reader::new(payload).finish()?;
+                Self::InventoryFull
+            }
+            opcode::EQUIPMENT_CHANGED => {
+                let mut reader = Reader::new(payload);
+                let slot = reader.u8()?;
+                let item = reader.u32()?;
+                reader.finish()?;
+                Self::EquipmentChanged { slot, item }
+            }
+            opcode::EQUIP_REFUSED => {
+                Reader::new(payload).finish()?;
+                Self::EquipRefused
+            }
             other => return Err(DecodeError::UnknownOpcode(other)),
         };
         Ok((message, consumed))
@@ -707,6 +784,8 @@ mod tests {
                 username: String::new(),
                 password: String::new(),
             },
+            ClientMessage::EquipItem { slot_index: 7 },
+            ClientMessage::UnequipItem { slot: 2 },
         ]
     }
 
@@ -762,6 +841,13 @@ mod tests {
             ServerMessage::AuthRefused {
                 reason: AuthRefusal::InvalidCredentials,
             },
+            ServerMessage::ItemReceived {
+                item: u32::MAX,
+                slot_index: 23,
+            },
+            ServerMessage::InventoryFull,
+            ServerMessage::EquipmentChanged { slot: 1, item: 0 },
+            ServerMessage::EquipRefused,
         ]
     }
 

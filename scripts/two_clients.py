@@ -16,7 +16,7 @@ import sys
 import time
 
 # Doit suivre PROTOCOL_VERSION cote Rust.
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 
 HANDSHAKE, PING, ENTER_WORLD, MOVE = 0x01, 0x02, 0x03, 0x04
 REGISTER = 0x07

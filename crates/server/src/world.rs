@@ -9,9 +9,10 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use hwarang_domain::{
-    AggroRule, AttackProfile, AttackRejection, Attributes, CellCoord, Character, CharacterId,
-    CombatRule, DefenseProfile, Engagement, Grid, Intent, MoveVerdict, MovementRule, Position,
-    ProgressionCurve, Resistance, Situation, Stance, Threat, experience_reward, resolve_attack,
+    AggroRule, AttackProfile, AttackRejection, Attributes, Catalog, CellCoord, Character,
+    CharacterId, CombatRule, DefenseProfile, Engagement, Equipment, Grid, Intent, Inventory,
+    ItemId, MoveVerdict, MovementRule, Position, ProgressionCurve, RegenerationRule, Resistance,
+    Situation, Slot, Stance, Threat, experience_reward, resolve_attack,
 };
 use hwarang_protocol::{AttackRefusal, EntityId, EntityKind, ServerMessage};
 use tokio::sync::mpsc::Sender;
@@ -64,9 +65,15 @@ struct Entity {
     rule: MovementRule,
     combat: CombatRule,
     character: Character,
+    inventory: Inventory,
+    equipment: Equipment,
     /// `None` pour un joueur : la connexion attend ses messages.
     outbox: Option<Outbox>,
     brain: Option<Brain>,
+    /// Dernier instant ou l'entite a subi des degats.
+    ///
+    /// `None` signifie « jamais touchee » : elle recupere donc sans attendre.
+    last_damaged: Option<Instant>,
     /// Entites actuellement percues. Maintenu symetriquement.
     visible: HashSet<EntityId>,
 }
@@ -84,19 +91,31 @@ impl Entity {
         }
     }
 
-    fn attack_profile(&self) -> AttackProfile {
-        // Statistique derivee, jamais stockee : elle ne peut pas se
-        // desynchroniser des attributs qui la produisent.
-        AttackProfile::new(BASE_ATTACK + u32::from(self.character.attributes().strength) * 5)
+    /// Statistiques derivees des attributs **et** de l'equipement porte.
+    ///
+    /// Jamais stockees : elles ne peuvent pas se desynchroniser de ce qui les
+    /// produit. Changer d'arme suffit a changer les degats au coup suivant, sans
+    /// qu'aucun recalcul n'ait a etre declenche.
+    fn attack_profile(&self, catalog: &Catalog) -> AttackProfile {
+        AttackProfile::new(
+            (BASE_ATTACK + u32::from(self.character.attributes().strength) * 5)
+                .saturating_add(self.equipment.attack_bonus(catalog)),
+        )
     }
 
-    fn defense_profile(&self) -> DefenseProfile {
-        DefenseProfile::new(u32::from(self.character.attributes().dexterity) * 10)
+    fn defense_profile(&self, catalog: &Catalog) -> DefenseProfile {
+        DefenseProfile::new(
+            (u32::from(self.character.attributes().dexterity) * 10)
+                .saturating_add(self.equipment.defense_bonus(catalog)),
+        )
     }
 }
 
 /// Puissance de base, avant contribution des attributs.
 const BASE_ATTACK: u32 = 120;
+
+/// Recuperation hors combat, identique pour tous.
+const REGENERATION: RegenerationRule = RegenerationRule::standard();
 
 /// Delai avant qu'une creature abattue ne revienne a son poste.
 ///
@@ -170,6 +189,94 @@ const fn refusal_of(rejection: AttackRejection) -> AttackRefusal {
     }
 }
 
+/// Objet laisse par une creature.
+///
+/// Determinist par identifiant : la meme creature laisse toujours le meme objet.
+/// Un tirage aleatoire rendrait la demonstration inreproductible, et le hasard
+/// merite son propre reglage plutot que d'etre glisse ici sans controle.
+fn loot_for(creature: EntityId) -> ItemId {
+    ItemId::new(u32::try_from(creature % LOOT_TABLE_SIZE).unwrap_or(0) + 1)
+}
+
+/// Nombre d'objets distincts que les creatures peuvent laisser.
+const LOOT_TABLE_SIZE: u64 = 3;
+
+const fn slot_from_code(code: u8) -> Option<Slot> {
+    match code {
+        1 => Some(Slot::Weapon),
+        2 => Some(Slot::Armor),
+        _ => None,
+    }
+}
+
+/// Catalogue de la zone de depart.
+///
+/// En dur pour l'instant, mais deja une **donnee** passee au monde : la sortir
+/// vers un fichier ne demandera pas de toucher aux regles.
+#[must_use]
+pub fn starting_catalog() -> Catalog {
+    Catalog::new()
+        .with(
+            ItemId::new(1),
+            hwarang_domain::ItemDefinition {
+                slot: Some(Slot::Weapon),
+                attack_bonus: 45,
+                ..hwarang_domain::ItemDefinition::default()
+            },
+        )
+        .with(
+            ItemId::new(2),
+            hwarang_domain::ItemDefinition {
+                slot: Some(Slot::Armor),
+                defense_bonus: 30,
+                ..hwarang_domain::ItemDefinition::default()
+            },
+        )
+        .with(
+            ItemId::new(3),
+            hwarang_domain::ItemDefinition {
+                slot: Some(Slot::Weapon),
+                attack_bonus: 150,
+                required_level: 15,
+                ..hwarang_domain::ItemDefinition::default()
+            },
+        )
+        // Seconde arme accessible des le depart : sans elle, le premier
+        // changement d'arme n'arrive qu'au palier 15, et l'echange avec le sac
+        // ne serait exerce qu'a ce moment-la.
+        .with(
+            ItemId::new(4),
+            hwarang_domain::ItemDefinition {
+                slot: Some(Slot::Weapon),
+                attack_bonus: 20,
+                ..hwarang_domain::ItemDefinition::default()
+            },
+        )
+}
+
+const fn equipment_changed(slot: Slot, item: Option<ItemId>) -> ServerMessage {
+    ServerMessage::EquipmentChanged {
+        slot: match slot {
+            Slot::Weapon => 1,
+            Slot::Armor => 2,
+        },
+        // 0 signale un emplacement vide : aucun objet ne porte cet identifiant.
+        item: match item {
+            Some(id) => id.get(),
+            None => 0,
+        },
+    }
+}
+
+/// Etat d'un joueur recharge depuis la persistance.
+#[derive(Debug, Clone)]
+pub struct RestoredPlayer {
+    pub character: Character,
+    pub position: Position,
+    pub inventory: Inventory,
+    pub equipment: Equipment,
+}
+
 /// Ce qu'une creature percoit a un instant donne.
 struct Observation {
     situation: Situation,
@@ -193,6 +300,8 @@ struct State {
 /// en memoire, et l'ecriture reseau se fait apres relachement, via les canaux.
 pub struct World {
     grid: Grid,
+    /// Definitions des objets. Donnee, pas code : fournie a la construction.
+    catalog: Catalog,
     state: Mutex<State>,
 }
 
@@ -205,8 +314,14 @@ impl Default for World {
 impl World {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_catalog(Catalog::new())
+    }
+
+    #[must_use]
+    pub fn with_catalog(catalog: Catalog) -> Self {
         Self {
             grid: Grid::with_default_view(),
+            catalog,
             state: Mutex::new(State::default()),
         }
     }
@@ -228,18 +343,23 @@ impl World {
         &self,
         id: EntityId,
         outbox: Outbox,
-        restored: Option<(Character, Position)>,
+        restored: Option<RestoredPlayer>,
     ) -> Position {
-        let (character, position) = restored.unwrap_or_else(|| {
-            (
-                Character::create(
-                    CharacterId::new(id),
-                    starting_attributes(),
-                    ProgressionCurve::DEFAULT,
-                ),
-                spawn_position(id),
-            )
-        });
+        let restored_inventory = restored.as_ref().map(|r| r.inventory.clone());
+        let restored_equipment = restored.as_ref().map(|r| r.equipment);
+        let (character, position) = restored.map_or_else(
+            || {
+                (
+                    Character::create(
+                        CharacterId::new(id),
+                        starting_attributes(),
+                        ProgressionCurve::DEFAULT,
+                    ),
+                    spawn_position(id),
+                )
+            },
+            |r| (r.character, r.position),
+        );
         let mut state = self.lock();
 
         state.entities.insert(
@@ -249,8 +369,11 @@ impl World {
                 rule: MovementRule::running(),
                 combat: CombatRule::melee(),
                 character,
+                inventory: restored_inventory.unwrap_or_default(),
+                equipment: restored_equipment.unwrap_or_default(),
                 outbox: Some(outbox),
                 brain: None,
+                last_damaged: None,
                 visible: HashSet::new(),
             },
         );
@@ -396,8 +519,8 @@ impl World {
         }
 
         let damage = resolve_attack(
-            attacker.attack_profile(),
-            target.defense_profile(),
+            attacker.attack_profile(&self.catalog),
+            target.defense_profile(&self.catalog),
             Resistance::NONE,
             target.character.level(),
         );
@@ -406,6 +529,7 @@ impl World {
             return false;
         };
         target.character = target.character.take_damage(damage);
+        target.last_damaged = Some(Instant::now());
         let remaining_health = target.character.vitals().current();
         let died = !target.character.is_alive();
 
@@ -479,6 +603,9 @@ impl World {
             brain.stance = Stance::Idle;
         }
         let reward = experience_reward(victim.character.level());
+        // Seules les creatures laissent du butin : depouiller un joueur vaincu
+        // est une decision de jeu lourde de consequences, pas un effet de bord.
+        let loot = victim.brain.is_some().then(|| loot_for(victim_id));
 
         broadcast_around(
             state,
@@ -504,6 +631,131 @@ impl World {
                 level: grown.level().get(),
             },
         );
+
+        Self::award_loot(state, killer_id, loot);
+    }
+
+    /// Remet le butin au vainqueur.
+    ///
+    /// L'objet va directement au sac plutot qu'au sol : un objet au sol est une
+    /// entite du monde a part entiere — visible, ramassable, expirable — et ce
+    /// contexte n'existe pas encore. Le sac plein fait perdre le butin, ce que
+    /// le joueur apprend explicitement.
+    fn award_loot(state: &mut State, winner: EntityId, loot: Option<ItemId>) {
+        let Some(item) = loot else { return };
+        let Some(entity) = state.entities.get(&winner) else {
+            return;
+        };
+
+        match entity.inventory.add(item) {
+            Ok((filled, index)) => {
+                if let Some(entity) = state.entities.get_mut(&winner) {
+                    entity.inventory = filled;
+                }
+                send(
+                    state,
+                    winner,
+                    ServerMessage::ItemReceived {
+                        item: item.get(),
+                        slot_index: u16::try_from(index).unwrap_or(u16::MAX),
+                    },
+                );
+            }
+            Err(_) => send(state, winner, ServerMessage::InventoryFull),
+        }
+    }
+
+    /// Equipe un objet du sac.
+    ///
+    /// L'objet quitte le sac et l'objet remplace y retourne : l'echange est
+    /// atomique, sinon un sac plein ferait disparaitre l'ancien equipement.
+    pub fn request_equip(&self, id: EntityId, slot_index: u16) {
+        let mut state = self.lock();
+        let Some(entity) = state.entities.get(&id) else {
+            return;
+        };
+
+        let index = usize::from(slot_index);
+        let Ok((emptied, item)) = entity.inventory.remove(index) else {
+            send(&state, id, ServerMessage::EquipRefused);
+            return;
+        };
+
+        let Some((equipped, replaced)) =
+            entity
+                .equipment
+                .equip(item, &self.catalog, entity.character.level())
+        else {
+            send(&state, id, ServerMessage::EquipRefused);
+            return;
+        };
+
+        // L'objet remplace reprend l'emplacement libere : il y a forcement la
+        // place, puisqu'on vient de l'y retirer.
+        let restored = match replaced {
+            Some(previous) => emptied
+                .add(previous)
+                .map_or(emptied.clone(), |(bag, _)| bag),
+            None => emptied,
+        };
+
+        let Some(entity) = state.entities.get_mut(&id) else {
+            return;
+        };
+        entity.inventory = restored;
+        entity.equipment = equipped;
+        let slot = self
+            .catalog
+            .definition(item)
+            .and_then(|definition| definition.slot);
+
+        if let Some(slot) = slot {
+            send(&state, id, equipment_changed(slot, Some(item)));
+        }
+    }
+
+    /// Retire un objet equipe et le remet au sac.
+    pub fn request_unequip(&self, id: EntityId, slot: Slot) {
+        let mut state = self.lock();
+        let Some(entity) = state.entities.get(&id) else {
+            return;
+        };
+
+        let (stripped, removed) = entity.equipment.unequip(slot);
+        let Some(item) = removed else {
+            send(&state, id, ServerMessage::EquipRefused);
+            return;
+        };
+
+        // Sac plein : l'objet reste equipe. Le detruire serait pire que de
+        // refuser l'operation.
+        let Ok((bag, _)) = entity.inventory.add(item) else {
+            send(&state, id, ServerMessage::InventoryFull);
+            return;
+        };
+
+        if let Some(entity) = state.entities.get_mut(&id) {
+            entity.inventory = bag;
+            entity.equipment = stripped;
+        }
+        send(&state, id, equipment_changed(slot, None));
+    }
+
+    /// Variante prenant le code d'emplacement du protocole.
+    pub fn request_unequip_code(&self, id: EntityId, code: u8) {
+        match slot_from_code(code) {
+            Some(slot) => self.request_unequip(id, slot),
+            // Code inconnu : le client parle d'un emplacement qui n'existe pas.
+            None => send(&self.lock(), id, ServerMessage::EquipRefused),
+        }
+    }
+
+    /// Sac et equipement d'une entite, pour la sauvegarde.
+    #[must_use]
+    pub fn belongings(&self, id: EntityId) -> Option<(Inventory, Equipment)> {
+        let state = self.lock();
+        let entity = state.entities.get(&id)?;
+        Some((entity.inventory.clone(), entity.equipment))
     }
 
     /// Retire une entite et previent ceux qui la percevaient.
@@ -560,7 +812,10 @@ impl World {
                     creature_attributes(),
                     ProgressionCurve::DEFAULT,
                 ),
+                inventory: Inventory::default(),
+                equipment: Equipment::empty(),
                 outbox: None,
+                last_damaged: None,
                 brain: Some(Brain {
                     rule: AggroRule::standard(CombatRule::MELEE_RANGE_CM),
                     anchor,
@@ -605,6 +860,8 @@ impl World {
     /// parametre plutot que mesure ici : la simulation reste ainsi rejouable a
     /// l'identique, et testable sans attendre.
     pub fn tick(&self, step: Duration, now: Instant) {
+        self.regenerate(step, now);
+
         let creatures: Vec<EntityId> = {
             let state = self.lock();
             state
@@ -617,6 +874,30 @@ impl World {
 
         for id in creatures {
             self.step_creature(id, step, now);
+        }
+    }
+
+    /// Rend des points de vie a tout ce qui est vivant et au calme.
+    ///
+    /// Joueurs comme creatures : une creature qui a survecu a un assaut doit se
+    /// remettre, sinon la deuxieme tentative d'un joueur se joue toujours sur un
+    /// adversaire deja entame, et la difficulte d'une zone depend de l'historique
+    /// plutot que de ce qu'elle est.
+    fn regenerate(&self, step: Duration, now: Instant) {
+        let elapsed_ms = u64::try_from(step.as_millis()).unwrap_or(u64::MAX);
+        let mut state = self.lock();
+
+        for entity in state.entities.values_mut() {
+            if !entity.is_alive() {
+                continue;
+            }
+            let idle_ms = entity.last_damaged.map_or(u64::MAX, |at| {
+                u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
+            });
+            let healed = REGENERATION.amount(idle_ms, elapsed_ms);
+            if healed > 0 {
+                entity.character = entity.character.regenerate(healed);
+            }
         }
     }
 
@@ -1009,6 +1290,7 @@ fn spawn_position(id: EntityId) -> Position {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use tokio::sync::mpsc::{Receiver, channel};
@@ -1388,6 +1670,357 @@ mod tests {
         assert!(
             blows >= 3,
             "{blows} coup(s) en 5 s simulees pour une cadence d'une seconde"
+        );
+    }
+
+    // --- Regeneration ---
+
+    #[test]
+    fn un_joueur_au_calme_recupere_ses_points_de_vie() {
+        // Sans cela, les degats s'accumulent d'un combat au suivant et le seul
+        // moyen de repartir en pleine sante est de mourir.
+        let world = World::new();
+        let mut player = join(&world, 1);
+        drain(&mut player);
+
+        let wounded = {
+            let mut state = world.lock();
+            let entity = state.entities.get_mut(&1).expect("entre");
+            entity.character = entity.character.take_damage(200);
+            entity.character.vitals().current()
+        };
+
+        let start = Instant::now();
+        for step in 0..40 {
+            world.tick(STEP, start + STEP * step);
+        }
+
+        let healed = world.lock().entities[&1].character.vitals().current();
+        assert!(
+            healed > wounded,
+            "aucune recuperation : {wounded} -> {healed}"
+        );
+    }
+
+    #[test]
+    fn un_joueur_frappe_a_l_instant_ne_recupere_pas() {
+        // Se soigner en encaissant rendrait la fuite inutile.
+        let world = World::new();
+        let (_attacker, _target) = duel(&world);
+        world.request_attack(1, 2, AT_EASE);
+        let wounded = world.lock().entities[&2].character.vitals().current();
+
+        // Un seul pas, immediatement apres le coup.
+        world.tick(STEP, Instant::now());
+
+        assert_eq!(
+            world.lock().entities[&2].character.vitals().current(),
+            wounded
+        );
+    }
+
+    #[test]
+    fn la_recuperation_ne_depasse_pas_le_maximum() {
+        let world = World::new();
+        let _player = join(&world, 1);
+
+        let start = Instant::now();
+        for step in 0..200 {
+            world.tick(STEP, start + STEP * step);
+        }
+
+        let vitals = world.lock().entities[&1].character.vitals();
+        assert_eq!(vitals.current(), vitals.max());
+    }
+
+    #[test]
+    fn un_mort_ne_recupere_pas() {
+        let world = World::new();
+        let (_attacker, _target) = duel(&world);
+        strike_until_dead(&world, 1, 2);
+
+        let start = Instant::now();
+        for step in 0..60 {
+            world.tick(STEP, start + STEP * step);
+        }
+
+        assert!(
+            !world.lock().entities[&2].is_alive(),
+            "un mort s'est releve tout seul"
+        );
+    }
+
+    #[test]
+    fn une_creature_survivante_recupere_aussi() {
+        // Sinon la difficulte d'une zone depend de l'historique des tentatives
+        // plutot que de ce qu'elle est.
+        let world = World::new();
+        world.spawn_creature(CREATURE, Position::new(500_000, 500_000));
+        let wounded = {
+            let mut state = world.lock();
+            let entity = state.entities.get_mut(&CREATURE).expect("apparue");
+            entity.character = entity.character.take_damage(50);
+            entity.character.vitals().current()
+        };
+
+        let start = Instant::now();
+        for step in 0..40 {
+            world.tick(STEP, start + STEP * step);
+        }
+
+        assert!(
+            world.lock().entities[&CREATURE]
+                .character
+                .vitals()
+                .current()
+                > wounded
+        );
+    }
+
+    // --- Objets ---
+
+    fn armed_world() -> World {
+        World::with_catalog(starting_catalog())
+    }
+
+    fn received_items(messages: &[ServerMessage]) -> Vec<u32> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::ItemReceived { item, .. } => Some(*item),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn inventory_of(world: &World, id: EntityId) -> Inventory {
+        world.lock().entities[&id].inventory.clone()
+    }
+
+    #[test]
+    fn abattre_une_creature_rapporte_du_butin() {
+        let world = armed_world();
+        world.spawn_creature(CREATURE, spawn_position(1));
+        let mut player = join(&world, 1);
+        drain(&mut player);
+
+        strike_until_dead(&world, 1, CREATURE);
+
+        let received = received_items(&drain(&mut player));
+        assert_eq!(received.len(), 1, "aucun butin, ou plusieurs");
+        assert!(!inventory_of(&world, 1).is_empty());
+    }
+
+    #[test]
+    fn abattre_un_joueur_ne_rapporte_aucun_butin() {
+        // Depouiller un vaincu est une decision de jeu lourde, pas un effet de
+        // bord de la mecanique de mort.
+        let world = armed_world();
+        let (mut attacker, _target) = duel(&world);
+
+        strike_until_dead(&world, 1, 2);
+
+        assert!(received_items(&drain(&mut attacker)).is_empty());
+    }
+
+    #[test]
+    fn un_sac_plein_fait_perdre_le_butin_et_le_joueur_l_apprend() {
+        let world = armed_world();
+        world.spawn_creature(CREATURE, spawn_position(1));
+        let mut player = join(&world, 1);
+
+        // Sac rempli jusqu'a la derniere place.
+        {
+            let mut state = world.lock();
+            let entity = state.entities.get_mut(&1).expect("le joueur est entre");
+            let mut bag = Inventory::default();
+            while let Ok((filled, _)) = bag.add(ItemId::new(1)) {
+                bag = filled;
+            }
+            entity.inventory = bag;
+        }
+        drain(&mut player);
+
+        strike_until_dead(&world, 1, CREATURE);
+
+        let messages = drain(&mut player);
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, ServerMessage::InventoryFull)),
+            "le joueur n'a pas ete prevenu"
+        );
+        assert!(received_items(&messages).is_empty());
+    }
+
+    #[test]
+    fn equiper_une_arme_augmente_les_degats() {
+        let world = armed_world();
+        let (_attacker, _target) = duel(&world);
+
+        let before = {
+            let state = world.lock();
+            state.entities[&1].attack_profile(&world.catalog).power()
+        };
+
+        {
+            let mut state = world.lock();
+            let entity = state.entities.get_mut(&1).expect("le joueur est entre");
+            entity.inventory = Inventory::default().placed(0, ItemId::new(1));
+        }
+        world.request_equip(1, 0);
+
+        let after = {
+            let state = world.lock();
+            state.entities[&1].attack_profile(&world.catalog).power()
+        };
+        assert!(
+            after > before,
+            "l'arme n'a rien change : {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn equiper_retire_l_objet_du_sac_et_previent_le_joueur() {
+        let world = armed_world();
+        let mut player = join(&world, 1);
+        {
+            let mut state = world.lock();
+            state.entities.get_mut(&1).expect("entre").inventory =
+                Inventory::default().placed(0, ItemId::new(1));
+        }
+        drain(&mut player);
+
+        world.request_equip(1, 0);
+
+        assert_eq!(inventory_of(&world, 1).at(0), None);
+        assert!(
+            drain(&mut player)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::EquipmentChanged { slot: 1, item: 1 }))
+        );
+    }
+
+    #[test]
+    fn remplacer_une_arme_remet_la_precedente_au_sac() {
+        // Sans cet echange, changer d'arme detruit silencieusement l'ancienne.
+        let world = armed_world();
+        let _player = join(&world, 1);
+        {
+            let mut state = world.lock();
+            // Deux armes : la seconde doit chasser la premiere vers le sac.
+            state.entities.get_mut(&1).expect("entre").inventory = Inventory::default()
+                .placed(0, ItemId::new(1))
+                .placed(1, ItemId::new(4));
+        }
+
+        world.request_equip(1, 0);
+        world.request_equip(1, 1);
+
+        let bag = inventory_of(&world, 1);
+        assert_eq!(bag.count(), 1, "l'arme remplacee a disparu");
+        assert_eq!(bag.at(0), Some(ItemId::new(1)));
+        assert_eq!(
+            world.lock().entities[&1].equipment.at(Slot::Weapon),
+            Some(ItemId::new(4))
+        );
+    }
+
+    #[test]
+    fn une_arme_et_une_armure_occupent_des_emplacements_distincts() {
+        let world = armed_world();
+        let _player = join(&world, 1);
+        {
+            let mut state = world.lock();
+            state.entities.get_mut(&1).expect("entre").inventory = Inventory::default()
+                .placed(0, ItemId::new(1))
+                .placed(1, ItemId::new(2));
+        }
+
+        world.request_equip(1, 0);
+        world.request_equip(1, 1);
+
+        let equipment = world.lock().entities[&1].equipment;
+        assert_eq!(equipment.at(Slot::Weapon), Some(ItemId::new(1)));
+        assert_eq!(equipment.at(Slot::Armor), Some(ItemId::new(2)));
+        assert!(inventory_of(&world, 1).is_empty());
+    }
+
+    #[test]
+    fn equiper_un_emplacement_vide_est_refuse() {
+        let world = armed_world();
+        let mut player = join(&world, 1);
+        drain(&mut player);
+
+        world.request_equip(1, 3);
+
+        assert!(
+            drain(&mut player)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::EquipRefused))
+        );
+    }
+
+    #[test]
+    fn un_objet_hors_de_portee_du_palier_est_refuse_et_reste_au_sac() {
+        let world = armed_world();
+        let mut player = join(&world, 1);
+        {
+            let mut state = world.lock();
+            // L'objet 3 demande le palier 15 ; le joueur est au palier 1.
+            state.entities.get_mut(&1).expect("entre").inventory =
+                Inventory::default().placed(0, ItemId::new(3));
+        }
+        drain(&mut player);
+
+        world.request_equip(1, 0);
+
+        assert_eq!(
+            inventory_of(&world, 1).at(0),
+            Some(ItemId::new(3)),
+            "l'objet refuse a quitte le sac"
+        );
+        assert!(
+            drain(&mut player)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::EquipRefused))
+        );
+    }
+
+    #[test]
+    fn retirer_un_objet_le_remet_au_sac() {
+        let world = armed_world();
+        let mut player = join(&world, 1);
+        {
+            let mut state = world.lock();
+            state.entities.get_mut(&1).expect("entre").inventory =
+                Inventory::default().placed(0, ItemId::new(1));
+        }
+        world.request_equip(1, 0);
+        drain(&mut player);
+
+        world.request_unequip_code(1, 1);
+
+        assert_eq!(inventory_of(&world, 1).count(), 1);
+        assert!(
+            drain(&mut player)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::EquipmentChanged { slot: 1, item: 0 }))
+        );
+    }
+
+    #[test]
+    fn un_emplacement_d_equipement_inconnu_est_refuse() {
+        let world = armed_world();
+        let mut player = join(&world, 1);
+        drain(&mut player);
+
+        world.request_unequip_code(1, 99);
+
+        assert!(
+            drain(&mut player)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::EquipRefused))
         );
     }
 

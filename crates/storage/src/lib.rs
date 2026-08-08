@@ -12,7 +12,8 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use hwarang_domain::{
-    Attributes, Character, CharacterId, Experience, Level, Position, ProgressionCurve,
+    Attributes, Character, CharacterId, Equipment, Experience, Inventory, ItemId, Level, Position,
+    ProgressionCurve, Slot,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -70,30 +71,53 @@ impl From<CredentialError> for StorageError {
 
 type Result<T> = std::result::Result<T, StorageError>;
 
+/// Reconstitue l'equipement depuis deux identifiants, 0 valant « rien ».
+///
+/// Le catalogue n'est pas consulte : la persistance restitue ce qui etait porte,
+/// et c'est au domaine de decider si cela reste equipable.
+fn equipment_from(weapon: u32, armor: u32) -> Equipment {
+    let mut equipment = Equipment::empty();
+    for (code, slot) in [(weapon, Slot::Weapon), (armor, Slot::Armor)] {
+        if code != 0 {
+            equipment = equipment.forced(slot, Some(ItemId::new(code)));
+        }
+    }
+    equipment
+}
+
 /// Etat d'un personnage tel qu'il traverse la persistance.
 ///
 /// Type distinct de `Character` : la sauvegarde porte la position, que le
 /// domaine ne connait pas (elle appartient au contexte monde), et elle doit
 /// pouvoir representer un etat qui ne passera l'invariant qu'a la relecture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedCharacter {
     pub level: u8,
     pub experience: u64,
     pub attributes: Attributes,
     pub current_health: u32,
     pub position: Position,
+    pub inventory: Inventory,
+    pub equipment: Equipment,
 }
 
 impl SavedCharacter {
     /// Capture l'etat d'un personnage en jeu.
     #[must_use]
-    pub fn of(character: &Character, position: Position) -> Self {
+    pub fn of(
+        character: &Character,
+        position: Position,
+        inventory: Inventory,
+        equipment: Equipment,
+    ) -> Self {
         Self {
             level: character.level().get(),
             experience: character.experience().get(),
             attributes: character.attributes(),
             current_health: character.vitals().current(),
             position,
+            inventory,
+            equipment,
         }
     }
 
@@ -102,7 +126,7 @@ impl SavedCharacter {
     /// # Errors
     /// [`StorageError::CorruptCharacter`] si l'etat sauvegarde ne satisfait pas
     /// les invariants du domaine — palier hors bornes, attributs impossibles.
-    pub fn into_character(self, id: CharacterId, curve: ProgressionCurve) -> Result<Character> {
+    pub fn into_character(&self, id: CharacterId, curve: ProgressionCurve) -> Result<Character> {
         let level = Level::new(self.level).ok_or(StorageError::CorruptCharacter)?;
         Character::restore(
             id,
@@ -220,10 +244,12 @@ impl Storage {
     /// # Errors
     /// Si la lecture echoue.
     pub fn load_character(&self, account: AccountId) -> Result<Option<SavedCharacter>> {
-        self.lock()
+        let inventory = self.load_inventory(account)?;
+        let connection = self.lock();
+        connection
             .query_row(
                 "SELECT level, experience, strength, dexterity, vitality, intellect,
-                        current_health, x, y
+                        current_health, x, y, weapon, armor
                  FROM characters WHERE account_id = ?1",
                 params![account.get()],
                 |row| {
@@ -241,11 +267,36 @@ impl Storage {
                         },
                         current_health: row.get(6)?,
                         position: Position::new(row.get(7)?, row.get(8)?),
+                        inventory: inventory.clone(),
+                        equipment: equipment_from(row.get(9)?, row.get(10)?),
                     })
                 },
             )
             .optional()
             .map_err(StorageError::from)
+    }
+
+    /// Contenu du sac, emplacements vides compris.
+    fn load_inventory(&self, account: AccountId) -> Result<Inventory> {
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare("SELECT slot_index, item_id FROM inventory_items WHERE account_id = ?1")?;
+        let rows = statement.query_map(params![account.get()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?))
+        })?;
+
+        let mut inventory = Inventory::default();
+        for row in rows {
+            let (index, item) = row?;
+            // Les emplacements sont restitues un par un plutot qu'empiles :
+            // un `add` successif tasserait le contenu et deplacerait les objets
+            // sous les yeux du joueur au premier rechargement.
+            inventory = inventory.placed(
+                usize::try_from(index).unwrap_or(usize::MAX),
+                ItemId::new(item),
+            );
+        }
+        Ok(inventory)
     }
 
     /// Ecrit l'etat d'un personnage, en creant la ligne au besoin.
@@ -256,8 +307,8 @@ impl Storage {
         self.lock().execute(
             "INSERT INTO characters
                 (account_id, level, experience, strength, dexterity, vitality,
-                 intellect, current_health, x, y, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, unixepoch())
+                 intellect, current_health, x, y, weapon, armor, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, unixepoch())
              ON CONFLICT(account_id) DO UPDATE SET
                 level = excluded.level,
                 experience = excluded.experience,
@@ -268,6 +319,8 @@ impl Storage {
                 current_health = excluded.current_health,
                 x = excluded.x,
                 y = excluded.y,
+                weapon = excluded.weapon,
+                armor = excluded.armor,
                 updated_at = excluded.updated_at",
             params![
                 account.get(),
@@ -280,8 +333,36 @@ impl Storage {
                 saved.current_health,
                 saved.position.x,
                 saved.position.y,
+                saved.equipment.at(Slot::Weapon).map_or(0, ItemId::get),
+                saved.equipment.at(Slot::Armor).map_or(0, ItemId::get),
             ],
         )?;
+        self.save_inventory(account, &saved.inventory)?;
+        Ok(())
+    }
+
+    /// Reecrit le sac en entier.
+    ///
+    /// Effacer puis reinserer plutot que de calculer un differentiel : le sac
+    /// tient en quelques dizaines de lignes, et un differentiel introduirait
+    /// une classe entiere de bogues de synchronisation pour rien.
+    fn save_inventory(&self, account: AccountId, inventory: &Inventory) -> Result<()> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM inventory_items WHERE account_id = ?1",
+            params![account.get()],
+        )?;
+        for (index, item) in inventory.slots() {
+            if let Some(item) = item {
+                transaction.execute(
+                    "INSERT INTO inventory_items (account_id, slot_index, item_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![account.get(), i64::try_from(index).unwrap_or(0), item.get()],
+                )?;
+            }
+        }
+        transaction.commit()?;
         Ok(())
     }
 }
@@ -307,6 +388,22 @@ mod tests {
             },
             current_health: 250,
             position: Position::new(-1_500, 2_400),
+            inventory: Inventory::default(),
+            equipment: Equipment::empty(),
+        }
+    }
+
+    /// Un personnage avec du bagage, pour verifier que rien ne se perd.
+    fn equipped_sample() -> SavedCharacter {
+        let bag = Inventory::default()
+            .placed(0, ItemId::new(7))
+            .placed(5, ItemId::new(9));
+        SavedCharacter {
+            inventory: bag,
+            equipment: Equipment::empty()
+                .forced(Slot::Weapon, Some(ItemId::new(1)))
+                .forced(Slot::Armor, Some(ItemId::new(2))),
+            ..sample()
         }
     }
 
@@ -487,13 +584,57 @@ mod tests {
             .unwrap();
         let position = Position::new(700, -300);
 
-        let captured = SavedCharacter::of(&character, position);
+        let captured = SavedCharacter::of(
+            &character,
+            position,
+            Inventory::default(),
+            Equipment::empty(),
+        );
         let round_tripped = captured
             .into_character(CharacterId::new(1), ProgressionCurve::DEFAULT)
             .unwrap();
 
         assert_eq!(round_tripped, character);
         assert_eq!(captured.position, position);
+    }
+
+    #[test]
+    fn le_sac_et_l_equipement_survivent_a_l_aller_retour() {
+        let storage = storage();
+        let account = storage.register("morgann", "mot-de-passe-solide").unwrap();
+        storage.save_character(account, &equipped_sample()).unwrap();
+
+        assert_eq!(
+            storage.load_character(account).unwrap(),
+            Some(equipped_sample())
+        );
+    }
+
+    #[test]
+    fn les_emplacements_du_sac_ne_se_tassent_pas_au_rechargement() {
+        // L'objet range en 5 doit revenir en 5, pas en 1 : sinon le contenu se
+        // reorganise a chaque reconnexion.
+        let storage = storage();
+        let account = storage.register("morgann", "mot-de-passe-solide").unwrap();
+        storage.save_character(account, &equipped_sample()).unwrap();
+
+        let reloaded = storage.load_character(account).unwrap().unwrap();
+        assert_eq!(reloaded.inventory.at(0), Some(ItemId::new(7)));
+        assert_eq!(reloaded.inventory.at(1), None);
+        assert_eq!(reloaded.inventory.at(5), Some(ItemId::new(9)));
+    }
+
+    #[test]
+    fn vider_son_sac_le_vide_aussi_en_base() {
+        // La reecriture complete doit effacer les lignes devenues obsoletes.
+        let storage = storage();
+        let account = storage.register("morgann", "mot-de-passe-solide").unwrap();
+        storage.save_character(account, &equipped_sample()).unwrap();
+        storage.save_character(account, &sample()).unwrap();
+
+        let reloaded = storage.load_character(account).unwrap().unwrap();
+        assert!(reloaded.inventory.is_empty(), "des objets ont survecu");
+        assert_eq!(reloaded.equipment, Equipment::empty());
     }
 
     #[test]

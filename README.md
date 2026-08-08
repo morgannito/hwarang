@@ -55,7 +55,8 @@ jeu est testable sans lancer un serveur ni une base de données.
 crates/
 ├── domain/     Règles de jeu. Zéro dépendance, zéro I/O.
 │   ├── ai/         perception, agressivité, laisse
-│   ├── character/  progression, attributs
+│   ├── character/  progression, attributs, régénération
+│   ├── item/       catalogue, inventaire, équipement
 │   ├── combat/     dégâts, engagement (portée, cadence)
 │   └── world/      positions, mouvement, grille d'intérêt
 ├── protocol/   Trames binaires client/serveur. Encodage explicite.
@@ -68,13 +69,13 @@ La dépendance ne va que dans un sens : `server → {protocol, storage} → doma
 ## Démarrer
 
 ```bash
-cargo test --workspace          # 189 tests
+cargo test --workspace          # 242 tests
 cargo run -p hwarang-server     # 127.0.0.1:13000, base ./hwarang.sqlite
 HWARANG_BIND=0.0.0.0:13000 HWARANG_DB=/var/lib/hwarang.sqlite \
   cargo run -p hwarang-server
 ```
 
-Cinq vérifications bout en bout, contre un serveur en cours d'exécution. Elles
+Six vérifications bout en bout, contre un serveur en cours d'exécution. Elles
 réimplémentent le format binaire au lieu de réutiliser `hwarang-protocol` : un
 test qui partagerait l'encodage du serveur ne prouverait rien sur ce qui circule
 réellement.
@@ -86,6 +87,8 @@ python3 scripts/combat.py 127.0.0.1 13000        # portée, cadence, mort, XP
 python3 scripts/creatures.py 127.0.0.1 13000     # créatures autonomes
 python3 scripts/persistence.py 127.0.0.1 13000 phase1   # puis redémarrer,
 python3 scripts/persistence.py 127.0.0.1 13000 phase2   # même HWARANG_DB
+python3 scripts/items.py 127.0.0.1 13000 phase1         # butin, équipement,
+python3 scripts/items.py 127.0.0.1 13000 phase2         # puis redémarrer
 ```
 
 Chacune attend un monde et une base vierges. La CI démarre un serveur neuf par
@@ -102,7 +105,7 @@ rien de clair quand il échoue.
 | Serveur : registre d'entités, diffusion, combat | fonctionnel |
 | Comptes (Argon2) et sauvegarde des personnages | fonctionnel |
 | Créatures autonomes, boucle de simulation | fonctionnel |
-| Objets, inventaire, butin | à faire |
+| Butin, inventaire, équipement, régénération | fonctionnel |
 | Client (Godot 4) | à faire |
 
 Ce qui marche aujourd'hui : on crée un compte, on entre dans le monde, on voit
@@ -112,6 +115,11 @@ et peut réapparaître. **On se déconnecte, le serveur redémarre, et on retrou
 son personnage où on l'avait laissé.** Le monde est peuplé de créatures qui
 remarquent le joueur, le poursuivent, ripostent sans qu'on leur parle, et
 reviennent à leur poste après avoir été abattues.
+
+Les créatures abattues laissent du butin ; l'équiper augmente les dégâts, et le
+sac comme l'équipement survivent au redémarrage. Hors combat, les points de vie
+reviennent — sans quoi la seule façon de repartir en pleine santé serait de
+mourir.
 
 Déplacement trop rapide, attaque hors de portée, rafale d'attaques, acharnement
 sur un cadavre : refusés par le serveur, avec le motif.

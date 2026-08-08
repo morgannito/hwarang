@@ -16,6 +16,7 @@ use hwarang_storage::{AccountId, SavedCharacter, Storage, StorageError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Sender, channel};
+use world::RestoredPlayer;
 
 use session::{AuthCommand, Reaction, Session, WorldCommand};
 use world::World;
@@ -46,7 +47,7 @@ async fn main() -> std::io::Result<()> {
         ))
     })?;
     let shared = Arc::new(Shared {
-        world: World::new(),
+        world: World::with_catalog(world::starting_catalog()),
         storage,
     });
 
@@ -245,14 +246,16 @@ const fn refusal_of(error: &StorageError) -> AuthRefusal {
 
 /// Ecrit l'etat du personnage, si la session en avait un en jeu.
 async fn persist(shared: &Arc<Shared>, session: &Session, entity: u64) {
-    let (Some(account), Some((character, position))) =
-        (session.account_id(), shared.world.snapshot(entity))
-    else {
+    let (Some(account), Some((character, position)), Some((inventory, equipment))) = (
+        session.account_id(),
+        shared.world.snapshot(entity),
+        shared.world.belongings(entity),
+    ) else {
         return;
     };
 
     let shared = Arc::clone(shared);
-    let saved = SavedCharacter::of(&character, position);
+    let saved = SavedCharacter::of(&character, position, inventory, equipment);
     let account = AccountId::from_u64(account);
 
     // L'ecriture disque est bloquante, comme le hachage.
@@ -328,6 +331,8 @@ async fn perform(
             shared.world.request_respawn(id);
             *clock = ActionClock::new();
         }
+        WorldCommand::Equip { slot_index } => shared.world.request_equip(id, slot_index),
+        WorldCommand::Unequip { slot } => shared.world.request_unequip_code(id, slot),
     }
 }
 
@@ -340,7 +345,7 @@ async fn load_character(
     shared: &Arc<Shared>,
     session: &Session,
     entity: u64,
-) -> Option<(hwarang_domain::Character, hwarang_domain::Position)> {
+) -> Option<RestoredPlayer> {
     let account = AccountId::from_u64(session.account_id()?);
     let shared_for_task = Arc::clone(shared);
 
@@ -352,11 +357,17 @@ async fn load_character(
     match loaded {
         Ok(Some(saved)) => {
             let position = saved.position;
+            let (inventory, equipment) = (saved.inventory.clone(), saved.equipment);
             match saved.into_character(
                 hwarang_domain::CharacterId::new(entity),
                 ProgressionCurve::DEFAULT,
             ) {
-                Ok(character) => Some((character, position)),
+                Ok(character) => Some(RestoredPlayer {
+                    character,
+                    position,
+                    inventory,
+                    equipment,
+                }),
                 Err(error) => {
                     eprintln!(
                         "sauvegarde illisible pour l'entite {entity}, reprise a neuf : {error}"
