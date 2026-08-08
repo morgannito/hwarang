@@ -19,3 +19,17 @@ export_presets.cfg
 # Caches Python des scripts de demonstration
 __pycache__/
 *.pyc
+
+# ---------------------------------------------------------------------------
+# Assets locaux : JAMAIS versionnes.
+#
+# Le depot est public et sous licence AGPL. Y committer des fichiers dont on
+# n'a pas les droits, c'est de la redistribution — et l'historique git les
+# conserve meme apres suppression, ce qui obligerait a le reecrire en entier.
+#
+# Poser ses assets dans client/assets/ : le client les charge s'ils sont la,
+# et retombe sur des formes geometriques sinon.
+# ---------------------------------------------------------------------------
+client/assets/*
+!client/assets/README.md
+!client/assets/.gitkeep

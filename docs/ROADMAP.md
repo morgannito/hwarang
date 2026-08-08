@@ -110,6 +110,16 @@ Trois voies, à trancher avant J3 car elle oriente le style du client :
 Décision non prise. La différence entre les trois n'est pas le budget, c'est
 d'accepter ou non que le jeu n'ait pas d'identité visuelle.
 
+**Distinction à ne pas perdre de vue.** Ce qu'on utilise localement et ce que le
+dépôt distribue sont deux choses différentes. `client/assets/` est exclu du
+versionnement : chacun y met ce qu'il veut sur sa machine, et le client
+fonctionne sans — il affiche alors des formes géométriques.
+
+Le jour où le projet doit *distribuer* des assets, il lui en faudra dont il a les
+droits. Committer des fichiers Ymir dans un dépôt public serait de la
+redistribution, avec DMCA sur le dépôt et strike sur le compte ; et l'historique
+git les conserverait après suppression, obligeant à le réécrire en entier.
+
 ### L'autre mur : la durée
 
 Un MMO solo n'échoue pas sur un obstacle technique, il s'arrête par lassitude
