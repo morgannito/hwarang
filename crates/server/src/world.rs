@@ -52,6 +52,13 @@ struct Brain {
     stance: Stance,
     /// Instant de la mort, pour la reapparition differee.
     died_at: Option<Instant>,
+    /// Objet laisse a la mort, s'il y en a un.
+    ///
+    /// Propriete de la creature, fixee a sa creation. Le deriver de
+    /// l'identifiant le rendrait tributaire d'un detail d'implementation :
+    /// changer la plage des identifiants changerait le butin de tout le monde,
+    /// sans que rien ne le signale.
+    loot: Option<ItemId>,
     /// Instant de la derniere attaque **portee**, pas de la derniere tentative.
     ///
     /// La creature tente sa chance a chaque pas de simulation : compter les
@@ -202,17 +209,11 @@ const fn refusal_of(rejection: AttackRejection) -> AttackRefusal {
     }
 }
 
-/// Objet laisse par une creature.
+/// Ce que laisse une creature de la zone de depart.
 ///
-/// Determinist par identifiant : la meme creature laisse toujours le meme objet.
-/// Un tirage aleatoire rendrait la demonstration inreproductible, et le hasard
-/// merite son propre reglage plutot que d'etre glisse ici sans controle.
-fn loot_for(creature: EntityId) -> ItemId {
-    ItemId::new(u32::try_from(creature % LOOT_TABLE_SIZE).unwrap_or(0) + 1)
-}
-
-/// Nombre d'objets distincts que les creatures peuvent laisser.
-const LOOT_TABLE_SIZE: u64 = 3;
+/// L'arme de base : le premier butin d'un joueur doit lui servir tout de suite,
+/// sinon la recompense d'un premier combat ne se voit pas.
+const DEFAULT_LOOT: ItemId = ItemId::new(1);
 
 const fn slot_from_code(code: u8) -> Option<Slot> {
     match code {
@@ -618,7 +619,7 @@ impl World {
         let reward = experience_reward(victim.character.level());
         // Seules les creatures laissent du butin : depouiller un joueur vaincu
         // est une decision de jeu lourde de consequences, pas un effet de bord.
-        let loot = victim.brain.is_some().then(|| loot_for(victim_id));
+        let loot = victim.brain.and_then(|brain| brain.loot);
 
         broadcast_around(
             state,
@@ -813,6 +814,11 @@ impl World {
     /// et un joueur partagent un identifiant, meme apres des milliers de
     /// connexions.
     pub fn spawn_creature(&self, id: EntityId, anchor: Position) {
+        self.spawn_creature_with_loot(id, anchor, Some(DEFAULT_LOOT));
+    }
+
+    /// Fait apparaitre une creature en choisissant ce qu'elle laissera.
+    pub fn spawn_creature_with_loot(&self, id: EntityId, anchor: Position, loot: Option<ItemId>) {
         let mut state = self.lock();
         state.entities.insert(
             id,
@@ -834,6 +840,7 @@ impl World {
                     anchor,
                     stance: Stance::Idle,
                     died_at: None,
+                    loot,
                     last_attack: None,
                 }),
                 visible: HashSet::new(),
@@ -1822,6 +1829,54 @@ mod tests {
         let received = received_items(&drain(&mut player));
         assert_eq!(received.len(), 1, "aucun butin, ou plusieurs");
         assert!(!inventory_of(&world, 1).is_empty());
+    }
+
+    #[test]
+    fn le_butin_ne_depend_pas_de_l_identifiant_de_la_creature() {
+        // Regression : le butin etait derive de `id % 3`. Changer la plage des
+        // identifiants changeait donc ce que laissait chaque creature, sans que
+        // rien ne le signale — une arme devenait une armure.
+        let world = armed_world();
+        let mut received = vec![];
+
+        for offset in [0_u64, 1, 2, 7, 1_000] {
+            let creature = CREATURE_ID_BASE + offset;
+            let player = 1 + offset;
+            world.spawn_creature(creature, spawn_position(player));
+            let mut inbox = join(&world, player);
+            drain(&mut inbox);
+
+            strike_until_dead(&world, player, creature);
+            received.extend(received_items(&drain(&mut inbox)));
+            world.leave(player);
+        }
+
+        assert_eq!(received.len(), 5, "un butin par creature abattue");
+        assert!(
+            received.iter().all(|item| *item == received[0]),
+            "le butin varie selon l'identifiant : {received:?}"
+        );
+    }
+
+    #[test]
+    fn le_butin_de_base_est_equipable_et_renforce_le_porteur() {
+        // La recompense d'un premier combat doit servir tout de suite, sinon
+        // elle ne se voit pas.
+        let world = armed_world();
+        let definition = world
+            .catalog
+            .definition(DEFAULT_LOOT)
+            .expect("le butin de base est au catalogue");
+
+        assert!(
+            definition.slot.is_some(),
+            "le butin de base ne s'equipe pas"
+        );
+        assert_eq!(definition.required_level, 1.min(definition.required_level));
+        assert!(
+            definition.attack_bonus > 0 || definition.defense_bonus > 0,
+            "le butin de base n'apporte rien"
+        );
     }
 
     #[test]
