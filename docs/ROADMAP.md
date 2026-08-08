@@ -122,19 +122,70 @@ qui vient après ajoute de la matière, pas des fondations.
 | Base de données | SQLite pour J4, PostgreSQL si la charge le justifie |
 | Chiffrement du transport | absent ; à traiter avant toute exposition hors réseau local |
 
-## Anomalies connues
+## Audit — ce qui a été trouvé et corrigé
 
-**Démonstrations enchaînées sur un même serveur.** Lancer `smoke`, `two_clients`
-et `combat` à la suite contre un seul serveur échoue environ une fois sur cinq.
-Isolées, elles passent systématiquement (12/12 pour `two_clients` seule, 15/15
-avec un serveur neuf par démonstration).
+Trois relectures adversariales (serveur, domaine, protocole/sécurité) ont
+produit trois défauts réels, tous corrigés :
 
-La cause n'est pas identifiée. L'hypothèse de travail est un reliquat d'état
-entre scénarios — entités en cours de retrait, identifiants déjà distribués —
-mais elle n'a pas été confirmée : les tentatives de reproduction ciblée
-(`combat` puis `two_clients`, cinq fois) n'ont rien déclenché.
+**Déni de service par file de sortie non bornée.** Un client pouvait entrer dans
+le monde puis cesser de lire sa socket. Son écriture réseau restait en attente,
+mais les autres joueurs continuaient d'alimenter sa file, laquelle croissait
+sans limite jusqu'à épuiser la mémoire du serveur — pour tout le monde, à partir
+d'un seul client. Le canal est désormais borné (`OUTBOX_CAPACITY`), avec un test
+qui pousse 10 000 événements vers un client inactif et vérifie le plafond.
 
-Contourné en CI par un serveur neuf par démonstration, ce qui est de toute façon
-la bonne pratique. **Le contournement n'est pas un diagnostic** : si un
-comportement dépend de l'état laissé par une session précédente, c'est une
-propriété du serveur qu'il faudra comprendre avant d'ajouter la persistance.
+*Limite assumée* : un message écrêté peut être un `EntityVanished`, ce qui laisse
+un fantôme à l'écran du client en retard. Distinguer les messages perdables
+(`EntityMoved`, remplacé par le suivant) de ceux qui portent une transition
+unique demandera de fermer la session plutôt que d'écrêter — à traiter quand le
+client existera et qu'on pourra observer le comportement.
+
+**Expérience résiduelle au palier terminal.** La boucle de franchissement
+sortait sans consommer le seuil en atteignant le niveau maximum, laissant une
+expérience très supérieure au seuil de son propre palier. Une barre de
+progression calculée comme `expérience / seuil` aurait dépassé 100 %. Corrigé,
+avec un test qui verrouille l'invariant « l'expérience est un reliquat, jamais
+un cumul » sur toute la plage de gains.
+
+**Documentation mensongère sur la cadence.** `request_attack` annonçait mesurer
+le temps depuis la dernière attaque *retenue* ; le code mesure depuis la
+dernière *tentative*, refusée comprise. Le comportement est le bon — compter les
+seules attaques abouties laisserait accumuler du temps à coups de refus puis le
+dépenser en salve — mais un mainteneur qui aurait fait confiance au commentaire
+aurait introduit la faille en « corrigeant » le code.
+
+Un bug de régression a été introduit puis attrapé pendant la correction du DoS :
+sur un canal borné `Sender::send` est asynchrone, et le `let _ =` qui traînait
+masquait un futur jamais attendu — plus aucun `EntityVanished` n'était émis à la
+déconnexion. Seul un test existant l'a vu.
+
+## Anomalie résolue — dérive du client après un refus
+
+Les démonstrations enchaînées échouaient environ une fois sur cinq. **Trois
+hypothèses ont été réfutées par la mesure avant de trouver la vraie cause**, et
+elles méritent d'être notées parce qu'elles étaient toutes plausibles :
+
+| Hypothèse | Réfutée par |
+|---|---|
+| Fuite d'entités entre sessions | le journal serveur affiche `0 en jeu` après chaque passe |
+| Reliquat d'état entre scénarios | `combat` puis `two_clients`, cinq fois : aucun échec |
+| Instabilité aléatoire | l'échec est déterministe une fois la bonne variable isolée |
+
+**Cause réelle**, dans le script de démonstration et non dans le serveur : après
+un déplacement refusé, le client conservait la position qu'il avait *demandée*
+au lieu de celle que le serveur lui *réaffirmait*. Il calculait alors le pas
+suivant depuis un point imaginaire, ce pas était refusé à son tour, et l'écart
+s'aggravait jusqu'à immobiliser le personnage.
+
+L'intermittence venait de l'amplitude de l'écart : la ligne de la grille
+d'apparition dépend de l'identifiant d'entité, donc du nombre de connexions déjà
+servies. Un écart de 300 cm était absorbé par la tolérance du premier pas ; un
+écart de 1200 cm ne l'était pas. En forçant les identifiants, l'échec devient
+reproductible à 100 %.
+
+**Correctif :** les clients de démonstration appliquent `MoveRejected` à leur
+état local — ce que `MoveRejected` sert précisément à permettre.
+
+**À retenir pour le client Godot (J3) :** traiter cette trame n'est pas
+optionnel. Un client qui l'ignore présente un personnage qui « ne répond plus »,
+sans aucune erreur affichée, alors que le serveur se comporte correctement.

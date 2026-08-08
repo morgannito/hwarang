@@ -22,6 +22,7 @@ PROTOCOL_VERSION = 3
 
 HANDSHAKE, PING, ENTER_WORLD, MOVE, ATTACK, RESPAWN = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
 HANDSHAKE_ACCEPTED, WORLD_ENTERED = 0x81, 0x84
+MOVE_REJECTED = 0x88
 DAMAGE_DEALT, ENTITY_DIED = 0x89, 0x8A
 ENTITY_RESPAWNED, ATTACK_REFUSED, EXPERIENCE_GAINED = 0x8B, 0x8C, 0x8D
 
@@ -76,8 +77,23 @@ class Client:
     def drain(self) -> list[tuple[int, bytes]]:
         frames = []
         while (frame := self.receive()) is not None:
+            self.reconcile(*frame)
             frames.append(frame)
         return frames
+
+    def reconcile(self, opcode: int, payload: bytes) -> None:
+        """Aligne l'etat local sur ce que le serveur affirme.
+
+        Sans cette remise a niveau, un pas refuse laisse le client en avance :
+        les suivants sont calcules depuis une position imaginaire, refuses a leur
+        tour, et l'approche n'aboutit jamais.
+        """
+        if opcode == MOVE_REJECTED:
+            self.x, self.y = struct.unpack(">ii", payload)
+        elif opcode == ENTITY_RESPAWNED:
+            entity, x, y, _ = struct.unpack(">QiiI", payload)
+            if entity == self.entity_id:
+                self.x, self.y = x, y
 
     def report(self) -> list[int]:
         opcodes = []

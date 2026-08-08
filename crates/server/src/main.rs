@@ -12,7 +12,7 @@ use std::time::Instant;
 use hwarang_protocol::{ClientMessage, DecodeError, MAX_FRAME_LEN, ServerMessage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Sender, channel};
 
 use session::{Reaction, Session, WorldCommand};
 use world::World;
@@ -64,7 +64,7 @@ async fn main() -> std::io::Result<()> {
 /// deplacement d'un voisin doit partir sans attendre que ce client parle.
 async fn serve(stream: TcpStream, mut session: Session, world: &World) -> std::io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
-    let (outbox, mut inbox) = unbounded_channel::<ServerMessage>();
+    let (outbox, mut inbox) = channel::<ServerMessage>(world::OUTBOX_CAPACITY);
 
     let mut buffer = Vec::with_capacity(MAX_FRAME_LEN);
     let mut chunk = [0_u8; 1024];
@@ -147,7 +147,7 @@ fn perform(
     command: WorldCommand,
     session: &Session,
     world: &World,
-    outbox: &UnboundedSender<ServerMessage>,
+    outbox: &Sender<ServerMessage>,
     clock: &mut ActionClock,
 ) {
     let id = session.entity_id();

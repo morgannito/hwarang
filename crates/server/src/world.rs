@@ -13,7 +13,8 @@ use hwarang_domain::{
     Resistance, experience_reward, resolve_attack,
 };
 use hwarang_protocol::{AttackRefusal, EntityId, ServerMessage};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::error::TrySendError;
 
 /// Rayon de perception, identique pour toutes les entites.
 ///
@@ -23,7 +24,20 @@ use tokio::sync::mpsc::UnboundedSender;
 const VIEW_RADIUS_CM: u32 = Grid::DEFAULT_VIEW_RADIUS_CM;
 
 /// Canal de sortie vers une connexion.
-type Outbox = UnboundedSender<ServerMessage>;
+///
+/// **Borne.** Un canal non borne permettrait a un client d'entrer dans le monde
+/// puis de cesser de lire sa socket : l'ecriture reseau le concernant reste en
+/// attente, mais les autres joueurs continuent de produire des evenements a son
+/// intention, et la file croit sans limite jusqu'a epuiser la memoire du
+/// serveur — un deni de service pour tout le monde, declenche par un seul
+/// client.
+type Outbox = Sender<ServerMessage>;
+
+/// Profondeur de la file de sortie par connexion.
+///
+/// Large de quoi absorber une rafale legitime (arrivee dans une zone peuplee,
+/// melee), etroite de quoi que le retard devienne visible avant de couter cher.
+pub const OUTBOX_CAPACITY: usize = 256;
 
 struct Entity {
     position: Position,
@@ -227,9 +241,13 @@ impl World {
 
     /// Resout une attaque revendiquee par un client.
     ///
-    /// `elapsed_ms` est mesure par le serveur depuis la derniere attaque
-    /// *retenue*, jamais annonce par le client — meme principe que pour le
-    /// deplacement.
+    /// `elapsed_ms` est mesure par le serveur depuis la derniere *tentative*,
+    /// retenue ou non, jamais annonce par le client.
+    ///
+    /// Compter depuis la derniere attaque *aboutie* laisserait un client
+    /// accumuler du temps a coups de tentatives refusees, puis le depenser en
+    /// salve. Le prix a payer est qu'une tentative hors de portee decale la
+    /// premiere frappe recevable d'un cycle de cadence.
     pub fn request_attack(&self, attacker_id: EntityId, target_id: EntityId, elapsed_ms: u64) {
         let mut state = self.lock();
 
@@ -390,10 +408,15 @@ impl World {
         for other in entity.visible {
             if let Some(watcher) = state.entities.get_mut(&other) {
                 watcher.visible.remove(&id);
-                let _ = watcher
-                    .outbox
-                    .send(ServerMessage::EntityVanished { entity_id: id });
             }
+            // Passe par `send` et non par l'`outbox` directement : sur un canal
+            // borne, `Sender::send` est asynchrone et un `let _ =` sur le futur
+            // n'envoie rien du tout, silencieusement.
+            send(
+                &state,
+                other,
+                ServerMessage::EntityVanished { entity_id: id },
+            );
         }
     }
 
@@ -509,11 +532,30 @@ fn broadcast_around(state: &State, first: EntityId, second: EntityId, message: S
     }
 }
 
-/// Un envoi qui echoue signifie que la connexion est deja fermee ; le retrait
-/// de l'entite viendra de la tache de lecture.
+/// Depose un message dans la file d'une connexion.
+///
+/// `try_send` et non `send().await` : la diffusion s'execute sous le verrou du
+/// monde, ou attendre un client lent bloquerait tous les autres.
+///
+/// Une file pleine designe un client qui ne draine plus sa socket. Le message
+/// est perdu et la memoire reste bornee, ce qui suffit a fermer la voie du deni
+/// de service ; la connexion, elle, mourra d'elle-meme quand son ecriture
+/// reseau expirera.
+///
+/// **Limite connue** : perdre un `EntityVanished` laisse un fantome a l'ecran du
+/// client en retard. Distinguer les messages qu'on peut perdre (`EntityMoved`,
+/// remplace par le suivant) de ceux qui portent une transition unique
+/// (`EntityVanished`, `EntityDied`) demandera de fermer la session au lieu
+/// d'ecreter — a traiter quand le client existera et qu'on pourra l'observer.
+///
+/// Un envoi qui echoue parce que le recepteur a disparu signifie que la
+/// connexion est deja fermee ; le retrait viendra de la tache de lecture.
 fn send(state: &State, id: EntityId, message: ServerMessage) {
-    if let Some(entity) = state.entities.get(&id) {
-        let _ = entity.outbox.send(message);
+    let Some(entity) = state.entities.get(&id) else {
+        return;
+    };
+    if let Err(TrySendError::Full(dropped)) = entity.outbox.try_send(message) {
+        eprintln!("entite {id} ne draine plus sa file, message perdu : {dropped:?}");
     }
 }
 
@@ -543,15 +585,15 @@ fn spawn_position(id: EntityId) -> Position {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio::sync::mpsc::{Receiver, channel};
 
-    fn join(world: &World, id: EntityId) -> UnboundedReceiver<ServerMessage> {
-        let (tx, rx) = unbounded_channel();
+    fn join(world: &World, id: EntityId) -> Receiver<ServerMessage> {
+        let (tx, rx) = channel(OUTBOX_CAPACITY);
         world.enter(id, tx);
         rx
     }
 
-    fn drain(rx: &mut UnboundedReceiver<ServerMessage>) -> Vec<ServerMessage> {
+    fn drain(rx: &mut Receiver<ServerMessage>) -> Vec<ServerMessage> {
         let mut messages = Vec::new();
         while let Ok(message) = rx.try_recv() {
             messages.push(message);
@@ -740,6 +782,27 @@ mod tests {
     }
 
     #[test]
+    fn un_client_qui_ne_draine_jamais_ne_fait_pas_enfler_la_memoire() {
+        // Un client entre dans le monde puis cesse de lire sa socket. Les autres
+        // joueurs continuent de produire des evenements a son intention. Avec un
+        // canal non borne, sa file croissait sans limite : un seul client
+        // suffisait a epuiser la memoire du serveur pour tout le monde.
+        let world = World::new();
+        let mut idle = join(&world, 1);
+        let _neighbour = join(&world, 2);
+
+        for step in 0..10_000 {
+            teleport(&world, 2, 100 + step % 200, 0);
+        }
+
+        let queued = drain(&mut idle).len();
+        assert!(
+            queued <= OUTBOX_CAPACITY,
+            "{queued} messages en file pour un plafond de {OUTBOX_CAPACITY}"
+        );
+    }
+
+    #[test]
     fn deplacer_une_entite_absente_est_sans_effet() {
         let world = World::new();
         world.request_move(404, 10, 10, 1_000);
@@ -763,12 +826,7 @@ mod tests {
     }
 
     /// Deux combattants au contact, journaux vides.
-    fn duel(
-        world: &World,
-    ) -> (
-        UnboundedReceiver<ServerMessage>,
-        UnboundedReceiver<ServerMessage>,
-    ) {
+    fn duel(world: &World) -> (Receiver<ServerMessage>, Receiver<ServerMessage>) {
         let mut first = join(world, 1);
         let mut second = join(world, 2);
         teleport(world, 2, spawn_position(1).x + 100, spawn_position(1).y);

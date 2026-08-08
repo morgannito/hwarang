@@ -68,8 +68,21 @@ class Client:
     def drain(self) -> list[tuple[int, bytes]]:
         frames = []
         while (frame := self.receive()) is not None:
+            self.reconcile(*frame)
             frames.append(frame)
         return frames
+
+    def reconcile(self, opcode: int, payload: bytes) -> None:
+        """Aligne l'etat local sur ce que le serveur affirme.
+
+        Un deplacement refuse laisse le client en avance sur le serveur. Sans
+        cette remise a niveau, l'ecart ne se resorbe jamais : chaque pas suivant
+        est calcule depuis une position imaginaire, donc refuse a son tour, et la
+        derive s'aggrave. C'est exactement ce que `MoveRejected` sert a eviter,
+        et pourquoi il transporte la position plutot qu'un simple refus.
+        """
+        if opcode == MOVE_REJECTED:
+            self.x, self.y = struct.unpack(">ii", payload)
 
     def report(self) -> list[int]:
         """Vide la boite de reception en journalisant, renvoie les opcodes vus."""
@@ -135,11 +148,12 @@ def main() -> int:
     bob.drain()
 
     print("\n4. Bob tente un saut de 10 km : le serveur refuse et le replace")
-    target = bob.x
+    before = (bob.x, bob.y)
     bob.move(1_000_000, 0)
-    bob.x, bob.y = target, bob.y  # le serveur a refuse : la position n'a pas bouge
     time.sleep(0.2)
+    # `reconcile` remet bob a la position que le serveur vient de reaffirmer.
     assert MOVE_REJECTED in bob.report(), "le saut n'a pas ete refuse"
+    assert (bob.x, bob.y) == before, "le client ne s'est pas resynchronise"
 
     # L'assertion porte sur les deplacements de bob, pas sur le silence total :
     # d'autres entites peuvent entrer ou sortir du champ d'alice au meme moment,

@@ -121,6 +121,13 @@ pub enum ServerMessage {
     ///
     /// Le serveur renvoie sa propre verite plutot qu'un simple refus, ce qui
     /// permet au client de se resynchroniser sans aller-retour supplementaire.
+    ///
+    /// **Le traitement de cette trame n'est pas optionnel.** Un client qui
+    /// l'ignore reste en avance sur le serveur : il calcule le pas suivant
+    /// depuis une position imaginaire, ce pas est refuse a son tour, et l'ecart
+    /// s'aggrave a chaque tentative jusqu'a immobiliser le joueur. Le symptome
+    /// observe est alors un personnage qui « ne repond plus », sans qu'aucune
+    /// trame d'erreur ne le signale — le serveur, lui, refuse correctement.
     MoveRejected {
         x: i32,
         y: i32,

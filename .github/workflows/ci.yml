@@ -45,10 +45,11 @@ jobs:
       # Lancement et verification dans le meme step : un process detache ne
       # survit pas de facon fiable d'un step a l'autre.
       #
-      # Un serveur neuf par demonstration. Enchainer les scenarios sur un meme
-      # monde les rend dependants de l'etat laisse par le precedent — entites en
-      # cours de deconnexion, identifiants deja distribues — et introduit des
-      # echecs intermittents qui ne disent rien du code teste.
+      # Un serveur neuf par demonstration : chaque scenario part d'un monde
+      # connu. Ce n'est pas un contournement — les demonstrations enchainees
+      # passent aussi (verifie sur 40 passes consecutives) — mais un scenario
+      # qui depend de ce qu'a laisse le precedent ne dit rien de clair en cas
+      # d'echec.
       #
       # Les scripts rejouent le format binaire sans passer par hwarang-protocol,
       # donc ils verifient ce qui sort reellement sur le fil.

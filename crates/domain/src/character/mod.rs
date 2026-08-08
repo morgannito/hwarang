@@ -135,7 +135,14 @@ impl Character {
             if pool < needed {
                 break;
             }
-            let Some(next) = level.next() else { break };
+            let Some(next) = level.next() else {
+                // Palier terminal atteint avec de quoi le franchir : le surplus
+                // est ecrete. Le conserver laisserait une experience superieure
+                // au seuil de son propre palier, et toute barre de progression
+                // calculee comme `experience / seuil` afficherait plus de 100 %.
+                pool = needed.saturating_sub(Experience::new(1));
+                break;
+            };
             pool = pool.saturating_sub(needed);
             level = next;
         }
@@ -248,6 +255,23 @@ mod tests {
         let (character, outcome) = hero().gain_experience(Experience::new(1_000_000));
         assert!(character.level().get() > 2, "un seul palier a ete franchi");
         assert!(matches!(outcome, ProgressionOutcome::LeveledUp { .. }));
+    }
+
+    #[test]
+    fn l_experience_reste_toujours_sous_le_seuil_de_son_palier() {
+        // Invariant transverse : `experience` est un reliquat, jamais un cumul.
+        // Il doit le rester au palier terminal, ou la boucle de franchissement
+        // s'arrete sans consommer le seuil.
+        let curve = ProgressionCurve::DEFAULT;
+        for gain in [1, 1_000, 100_000, u64::MAX / 2, u64::MAX] {
+            let (character, _) = hero().gain_experience(Experience::new(gain));
+            assert!(
+                character.experience() < curve.required_to_leave(character.level()),
+                "gain {gain} : reliquat {:?} au-dela du seuil du palier {}",
+                character.experience(),
+                character.level().get()
+            );
+        }
     }
 
     #[test]
