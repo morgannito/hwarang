@@ -119,3 +119,59 @@ jobs:
 
           run_two_phase persistence.py 13004
           run_two_phase items.py 13006
+
+  client:
+    name: client Godot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Installer Godot
+        env:
+          # Version epinglee : une mise a jour de Godot ne doit pas casser la CI
+          # sans qu'on l'ait decide.
+          GODOT_VERSION: 4.7.1
+        run: |
+          set -euo pipefail
+          url="https://github.com/godotengine/godot/releases/download"
+          url="$url/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          curl -fsSL "$url" -o godot.zip
+          unzip -q godot.zip
+          mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" /usr/local/bin/godot
+          chmod +x /usr/local/bin/godot
+          godot --version
+
+      - name: Build du serveur
+        run: cargo build --release -p hwarang-server
+
+      # Ce test verifie ce qu'aucun test unitaire ne peut atteindre : que
+      # l'encodage gros-boutiste de GDScript correspond a ce que le serveur Rust
+      # emet. Une inversion d'octets passerait toutes les verifications internes
+      # de chaque cote et ne se verrait qu'ici.
+      - name: Client contre serveur
+        run: |
+          set -euo pipefail
+          db="$(mktemp -d)/hwarang.sqlite"
+          HWARANG_DB="$db" HWARANG_BIND=127.0.0.1:13100 \
+            ./target/release/hwarang-server &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+
+          python3 - <<'WAIT'
+          import socket, sys, time
+          deadline = time.monotonic() + 15
+          while time.monotonic() < deadline:
+              try:
+                  socket.create_connection(("127.0.0.1", 13100), timeout=1).close()
+                  sys.exit(0)
+              except OSError:
+                  time.sleep(0.2)
+          sys.exit("le serveur n'a pas ouvert le port")
+          WAIT
+
+          # Premiere passe : importation des ressources. Sans elle, le script
+          # s'execute avant que les classes globales ne soient enregistrees.
+          godot --headless --path client --import || true
+          godot --headless --path client --script res://tests/integration.gd -- --port 13100

@@ -123,6 +123,19 @@ const REGENERATION: RegenerationRule = RegenerationRule::standard();
 /// laissera un jour ; assez court pour qu'une zone ne se vide pas.
 pub const CREATURE_RESPAWN_DELAY: Duration = Duration::from_secs(10);
 
+/// Debut de la plage d'identifiants reservee aux creatures.
+///
+/// Les sessions montent depuis 1, les creatures depuis ce seuil : les deux
+/// suites ne peuvent pas se croiser avant des milliards de connexions.
+///
+/// Volontairement **sous** `i64::MAX` et non descendant depuis `u64::MAX` :
+/// beaucoup de langages clients n'ont que des entiers signes 64 bits — `GDScript`
+/// et JavaScript notamment. Un identifiant au-dela de `i64::MAX` y apparait
+/// negatif. L'aller-retour reste correct, les bits etant les memes, mais tout
+/// affichage ou journal devient illisible et la moindre comparaison arithmetique
+/// se comporte de travers.
+pub const CREATURE_ID_BASE: EntityId = 1 << 62;
+
 /// Premier poste de la zone de depart, a l'ecart du point d'apparition des
 /// joueurs : on doit aller chercher les creatures, pas naitre au milieu.
 const STARTING_AREA_ORIGIN: Position = Position::new(6_000, 1_500);
@@ -842,15 +855,15 @@ impl World {
     /// « reveil de groupe » involontaire est ce qui rend une zone de depart
     /// injouable.
     ///
-    /// Les identifiants descendent depuis `u64::MAX`, ceux des sessions montent
-    /// depuis 1 : les deux suites ne peuvent pas se croiser.
+    /// Les identifiants partent de [`CREATURE_ID_BASE`] et montent, ceux des
+    /// sessions montent depuis 1 : les deux suites ne peuvent pas se croiser.
     pub fn populate_starting_area(&self, count: u64) {
         for index in 0..count {
             let anchor = Position::new(
                 STARTING_AREA_ORIGIN.x + i32::try_from(index).unwrap_or(0) * CREATURE_SPACING_CM,
                 STARTING_AREA_ORIGIN.y,
             );
-            self.spawn_creature(u64::MAX - index, anchor);
+            self.spawn_creature(CREATURE_ID_BASE + index, anchor);
         }
     }
 
@@ -1512,7 +1525,7 @@ mod tests {
 
     // --- Creatures ---
 
-    const CREATURE: EntityId = u64::MAX;
+    const CREATURE: EntityId = CREATURE_ID_BASE;
     const STEP: Duration = Duration::from_millis(200);
 
     fn creature_position(world: &World) -> Position {
@@ -2126,11 +2139,11 @@ mod tests {
     fn une_creature_n_attaque_pas_une_autre_creature() {
         let world = World::new();
         world.spawn_creature(CREATURE, Position::new(1_000, 0));
-        world.spawn_creature(CREATURE - 1, Position::new(1_100, 0));
+        world.spawn_creature(CREATURE + 1, Position::new(1_100, 0));
 
         run_ticks(&world, 5);
 
-        for id in [CREATURE, CREATURE - 1] {
+        for id in [CREATURE, CREATURE + 1] {
             let entity = &world.lock().entities[&id];
             assert_eq!(
                 entity.character.vitals().current(),
@@ -2189,6 +2202,39 @@ mod tests {
                     "l'emplacement {slot} nait dans le rayon d'une creature"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn les_identifiants_de_creature_tiennent_dans_un_entier_signe() {
+        // Beaucoup de langages clients — GDScript, JavaScript — n'ont que des
+        // entiers signes 64 bits. Un identifiant au-dela de `i64::MAX` y
+        // apparait negatif : l'aller-retour reste juste, mais les journaux
+        // deviennent illisibles et les comparaisons se comportent de travers.
+        let world = World::new();
+        world.populate_starting_area(64);
+
+        for id in world.lock().entities.keys() {
+            assert!(
+                i64::try_from(*id).is_ok(),
+                "l'identifiant {id} deborde un entier signe"
+            );
+        }
+    }
+
+    #[test]
+    fn les_plages_d_identifiants_ne_se_croisent_pas() {
+        // Les sessions montent depuis 1, les creatures depuis leur seuil : il
+        // faudrait des milliards de connexions pour que les deux se rejoignent.
+        let world = World::new();
+        world.populate_starting_area(8);
+        let _first_session = join(&world, 1);
+
+        for id in world.lock().entities.keys() {
+            assert!(
+                *id == 1 || *id >= CREATURE_ID_BASE,
+                "identifiant {id} hors plage"
+            );
         }
     }
 

@@ -65,26 +65,31 @@ moyen de repartir en pleine santé est de mourir. Constaté en enchaînant deux
 adversaires, pas en relisant le code.
 **Démo :** `scripts/items.py`, en deux phases autour d'un redémarrage.
 
+### J3 — Client Godot
+Vue de dessus 2D, Godot 4.7 (arm64 natif, vérifié). Prédiction locale du
+déplacement, interpolation entre les positions reçues, réconciliation sur
+`MoveRejected`.
+
+**L'inconnue est levée** : lire du binaire gros-boutiste depuis GDScript
+fonctionne, via `StreamPeerBuffer.big_endian`. Ce n'est pas le défaut — sans
+cette ligne, chaque entier arrive à l'envers et le flux paraît corrompu dès la
+première trame.
+
+Un défaut d'interopérabilité trouvé au passage : les identifiants de créatures
+descendaient de `u64::MAX`, et GDScript n'a que des entiers **signés**.
+`u64::MAX` s'y affichait `-1`. L'aller-retour restait juste — mêmes bits — mais
+les journaux devenaient illisibles. Les identifiants partent désormais de `2^62`,
+sous `i64::MAX`.
+
+**Démo :** `client/tests/integration.gd`, exécuté par la CI contre le vrai
+serveur.
+
 ---
 
 ## Phase 1 — Faire du serveur un jeu
 
 Technique pure, solo, effort prévisible. C'est la partie où le projet avance
 vite, et il faut en profiter pour la finir proprement.
-
-### J3 — Visualiseur Godot · **moyen**
-
-Client minimal, **sans aucun art** : capsules, sol quadrillé, barres de vie.
-
-- connexion `StreamPeerTCP`, décodage du protocole binaire en GDScript
-- interpolation entre positions reçues, sinon le mouvement est saccadé
-- réconciliation sur `MoveRejected`
-
-**Fini quand :** deux fenêtres Godot côte à côte, on déplace l'une, l'autre le
-voit ; un client bricolé pour tricher se fait replacer visiblement.
-
-**Inconnue non levée :** lire du binaire big-endian depuis GDScript
-(`PackedByteArray`, lectures partielles). Non vérifié à ce jour.
 
 ---
 
@@ -136,7 +141,7 @@ image. Tout ce qui vient après ajoute de la matière, pas des fondations.
 | Sujet | État |
 |---|---|
 | Dépôt public ou privé | **public** depuis le 08/08/2026 ; la CI Actions fonctionne (gratuite et illimitée en public) |
-| Origine des assets | non tranchée — à décider avant J3 |
+| Origine des assets | non tranchée. `client/assets/` est hors versionnement : ce qu'on y met localement ne regarde que soi. Pour *distribuer*, il faudra des assets dont le projet a les droits |
 | Base de données | SQLite en place ; PostgreSQL si la charge le justifie, le domaine n'en dépend pas |
 | Chiffrement du transport | absent ; à traiter avant toute exposition hors réseau local |
 

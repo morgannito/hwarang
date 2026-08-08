@@ -62,6 +62,8 @@ crates/
 ├── protocol/   Trames binaires client/serveur. Encodage explicite.
 ├── storage/    Comptes et sauvegardes. SQLite + Argon2.
 └── server/     Adaptateur TCP + registre d'entités. Aucune règle de jeu.
+
+client/         Client Godot 4 (vue de dessus 2D). Aucune règle de jeu.
 ```
 
 La dépendance ne va que dans un sens : `server → {protocol, storage} → domain`.
@@ -69,7 +71,7 @@ La dépendance ne va que dans un sens : `server → {protocol, storage} → doma
 ## Démarrer
 
 ```bash
-cargo test --workspace          # 242 tests
+cargo test --workspace          # 244 tests
 cargo run -p hwarang-server     # 127.0.0.1:13000, base ./hwarang.sqlite
 HWARANG_BIND=0.0.0.0:13000 HWARANG_DB=/var/lib/hwarang.sqlite \
   cargo run -p hwarang-server
@@ -106,7 +108,8 @@ rien de clair quand il échoue.
 | Comptes (Argon2) et sauvegarde des personnages | fonctionnel |
 | Créatures autonomes, boucle de simulation | fonctionnel |
 | Butin, inventaire, équipement, régénération | fonctionnel |
-| Client (Godot 4) | à faire |
+| Client Godot : déplacement, combat, interpolation | fonctionnel |
+| Art (modèles, animations, cartes) | inexistant — voir la roadmap |
 
 Ce qui marche aujourd'hui : on crée un compte, on entre dans le monde, on voit
 les autres joueurs bouger en temps réel, on les perd de vue en s'éloignant, on
@@ -123,6 +126,19 @@ mourir.
 
 Déplacement trop rapide, attaque hors de portée, rafale d'attaques, acharnement
 sur un cadavre : refusés par le serveur, avec le motif.
+
+## Client
+
+```bash
+godot --path client -- --port 13000 --account moi
+```
+
+ZQSD pour se déplacer, espace pour attaquer la cible la plus proche. Voir
+[client/README.md](client/README.md).
+
+Il affiche des disques : le projet n'a aucun art. `client/assets/` n'est pas
+versionné — ce qu'on y pose localement ne regarde que soi, et le client
+fonctionne sans.
 
 ## Suite
 
