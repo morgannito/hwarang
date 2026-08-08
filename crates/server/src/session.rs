@@ -14,6 +14,8 @@ use hwarang_protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
 pub enum WorldCommand {
     Enter,
     Move { x: i32, y: i32 },
+    Attack { target: u64 },
+    Respawn,
 }
 
 /// Suite a donner apres traitement d'une trame.
@@ -94,6 +96,14 @@ impl Session {
                 Reaction::Perform(WorldCommand::Move { x, y })
             }
 
+            // Attaque et reapparition sont refusees par le monde, pas ici : leur
+            // recevabilite depend de l'etat du jeu (portee, cadence, mort), que
+            // la session ne connait pas et n'a pas a dupliquer.
+            (State::InWorld, ClientMessage::Attack { target }) => {
+                Reaction::Perform(WorldCommand::Attack { target })
+            }
+            (State::InWorld, ClientMessage::Respawn) => Reaction::Perform(WorldCommand::Respawn),
+
             // Reste : trame avant le handshake, deplacement avant l'entree dans
             // le monde, seconde entree, handshake rejoue.
             _ => Reaction::Close,
@@ -154,6 +164,8 @@ mod tests {
             ClientMessage::Ping { nonce: 1 },
             ClientMessage::EnterWorld,
             ClientMessage::Move { x: 0, y: 0 },
+            ClientMessage::Attack { target: 1 },
+            ClientMessage::Respawn,
         ] {
             let mut session = Session::new(7);
             assert_eq!(session.on_message(message), Reaction::Close, "{message:?}");
@@ -180,11 +192,27 @@ mod tests {
     }
 
     #[test]
-    fn se_deplacer_avant_d_entrer_ferme_la_connexion() {
-        let mut session = authenticated();
+    fn agir_avant_d_entrer_dans_le_monde_ferme_la_connexion() {
+        for message in [
+            ClientMessage::Move { x: 1, y: 1 },
+            ClientMessage::Attack { target: 2 },
+            ClientMessage::Respawn,
+        ] {
+            let mut session = authenticated();
+            assert_eq!(session.on_message(message), Reaction::Close, "{message:?}");
+        }
+    }
+
+    #[test]
+    fn attaquer_et_reapparaitre_sont_transmis_au_monde() {
+        let mut session = in_world();
         assert_eq!(
-            session.on_message(ClientMessage::Move { x: 1, y: 1 }),
-            Reaction::Close
+            session.on_message(ClientMessage::Attack { target: 42 }),
+            Reaction::Perform(WorldCommand::Attack { target: 42 })
+        );
+        assert_eq!(
+            session.on_message(ClientMessage::Respawn),
+            Reaction::Perform(WorldCommand::Respawn)
         );
     }
 

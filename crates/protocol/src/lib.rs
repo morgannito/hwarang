@@ -14,7 +14,7 @@ use codec::{Reader, Writer};
 /// Version du protocole. Toute rupture de format incremente cette valeur, ce
 /// qui permet au serveur de refuser proprement un client desynchronise plutot
 /// que de mal interpreter ses octets.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Plafond d'une trame. Borne l'allocation faite sur donnee non fiable : sans
 /// lui, un client hostile annonce 65535 octets et fait allouer le serveur.
@@ -39,6 +39,49 @@ pub enum ClientMessage {
     /// Le client propose, le serveur dispose : cette trame est une intention,
     /// pas un fait. Voir `MoveRejected`.
     Move { x: i32, y: i32 },
+    /// Tentative d'attaque sur une entite.
+    Attack { target: EntityId },
+    /// Demande de retour en jeu apres une mort.
+    Respawn,
+}
+
+/// Motif de refus d'une attaque, transmis au client.
+///
+/// Enumere plutot que textuel : le client localise le message, le serveur
+/// n'envoie pas de chaine a traduire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttackRefusal {
+    OutOfRange,
+    TooSoon,
+    AttackerDown,
+    TargetDown,
+    SelfTarget,
+    NoSuchTarget,
+}
+
+impl AttackRefusal {
+    const fn code(self) -> u8 {
+        match self {
+            Self::OutOfRange => 1,
+            Self::TooSoon => 2,
+            Self::AttackerDown => 3,
+            Self::TargetDown => 4,
+            Self::SelfTarget => 5,
+            Self::NoSuchTarget => 6,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::OutOfRange),
+            2 => Some(Self::TooSoon),
+            3 => Some(Self::AttackerDown),
+            4 => Some(Self::TargetDown),
+            5 => Some(Self::SelfTarget),
+            6 => Some(Self::NoSuchTarget),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +125,38 @@ pub enum ServerMessage {
         x: i32,
         y: i32,
     },
+    /// Une attaque a porte.
+    ///
+    /// Les points de vie restants accompagnent les degats : un temoin qui vient
+    /// d'arriver dans la zone connait l'etat de la cible sans avoir suivi tout
+    /// l'echange.
+    DamageDealt {
+        attacker: EntityId,
+        target: EntityId,
+        damage: u32,
+        remaining_health: u32,
+    },
+    /// Une entite est tombee.
+    EntityDied {
+        entity: EntityId,
+        killer: EntityId,
+    },
+    /// Une entite est revenue en jeu.
+    EntityRespawned {
+        entity: EntityId,
+        x: i32,
+        y: i32,
+        health: u32,
+    },
+    /// Attaque refusee, avec son motif.
+    AttackRefused {
+        reason: AttackRefusal,
+    },
+    /// Experience gagnee, et palier atteint apres application.
+    ExperienceGained {
+        amount: u64,
+        level: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +176,8 @@ mod opcode {
     pub const PING: u8 = 0x02;
     pub const ENTER_WORLD: u8 = 0x03;
     pub const MOVE: u8 = 0x04;
+    pub const ATTACK: u8 = 0x05;
+    pub const RESPAWN: u8 = 0x06;
 
     pub const HANDSHAKE_ACCEPTED: u8 = 0x81;
     pub const HANDSHAKE_REJECTED: u8 = 0x82;
@@ -110,6 +187,11 @@ mod opcode {
     pub const ENTITY_MOVED: u8 = 0x86;
     pub const ENTITY_VANISHED: u8 = 0x87;
     pub const MOVE_REJECTED: u8 = 0x88;
+    pub const DAMAGE_DEALT: u8 = 0x89;
+    pub const ENTITY_DIED: u8 = 0x8A;
+    pub const ENTITY_RESPAWNED: u8 = 0x8B;
+    pub const ATTACK_REFUSED: u8 = 0x8C;
+    pub const EXPERIENCE_GAINED: u8 = 0x8D;
 }
 
 /// Isole une trame du flux : retourne `(opcode, charge utile, octets consommes)`.
@@ -186,6 +268,10 @@ impl ClientMessage {
             Self::Move { x, y } => {
                 frame(opcode::MOVE, &Writer::default().i32(x).i32(y).into_bytes())
             }
+            Self::Attack { target } => {
+                frame(opcode::ATTACK, &Writer::default().u64(target).into_bytes())
+            }
+            Self::Respawn => frame(opcode::RESPAWN, &[]),
         }
     }
 
@@ -216,6 +302,16 @@ impl ClientMessage {
             opcode::MOVE => {
                 let (x, y) = read_point(payload)?;
                 Self::Move { x, y }
+            }
+            opcode::ATTACK => {
+                let mut reader = Reader::new(payload);
+                let target = reader.u64()?;
+                reader.finish()?;
+                Self::Attack { target }
+            }
+            opcode::RESPAWN => {
+                Reader::new(payload).finish()?;
+                Self::Respawn
             }
             other => return Err(DecodeError::UnknownOpcode(other)),
         };
@@ -252,6 +348,46 @@ impl ServerMessage {
             Self::MoveRejected { x, y } => frame(
                 opcode::MOVE_REJECTED,
                 &Writer::default().i32(x).i32(y).into_bytes(),
+            ),
+            Self::DamageDealt {
+                attacker,
+                target,
+                damage,
+                remaining_health,
+            } => frame(
+                opcode::DAMAGE_DEALT,
+                &Writer::default()
+                    .u64(attacker)
+                    .u64(target)
+                    .u32(damage)
+                    .u32(remaining_health)
+                    .into_bytes(),
+            ),
+            Self::EntityDied { entity, killer } => frame(
+                opcode::ENTITY_DIED,
+                &Writer::default().u64(entity).u64(killer).into_bytes(),
+            ),
+            Self::EntityRespawned {
+                entity,
+                x,
+                y,
+                health,
+            } => frame(
+                opcode::ENTITY_RESPAWNED,
+                &Writer::default()
+                    .u64(entity)
+                    .i32(x)
+                    .i32(y)
+                    .u32(health)
+                    .into_bytes(),
+            ),
+            Self::AttackRefused { reason } => frame(
+                opcode::ATTACK_REFUSED,
+                &Writer::default().u8(reason.code()).into_bytes(),
+            ),
+            Self::ExperienceGained { amount, level } => frame(
+                opcode::EXPERIENCE_GAINED,
+                &Writer::default().u64(amount).u8(level).into_bytes(),
             ),
         }
     }
@@ -301,6 +437,56 @@ impl ServerMessage {
                 let (x, y) = read_point(payload)?;
                 Self::MoveRejected { x, y }
             }
+            opcode::DAMAGE_DEALT => {
+                let mut reader = Reader::new(payload);
+                let attacker = reader.u64()?;
+                let target = reader.u64()?;
+                let damage = reader.u32()?;
+                let remaining_health = reader.u32()?;
+                reader.finish()?;
+                Self::DamageDealt {
+                    attacker,
+                    target,
+                    damage,
+                    remaining_health,
+                }
+            }
+            opcode::ENTITY_DIED => {
+                let mut reader = Reader::new(payload);
+                let entity = reader.u64()?;
+                let killer = reader.u64()?;
+                reader.finish()?;
+                Self::EntityDied { entity, killer }
+            }
+            opcode::ENTITY_RESPAWNED => {
+                let mut reader = Reader::new(payload);
+                let entity = reader.u64()?;
+                let x = reader.i32()?;
+                let y = reader.i32()?;
+                let health = reader.u32()?;
+                reader.finish()?;
+                Self::EntityRespawned {
+                    entity,
+                    x,
+                    y,
+                    health,
+                }
+            }
+            opcode::ATTACK_REFUSED => {
+                let mut reader = Reader::new(payload);
+                let code = reader.u8()?;
+                reader.finish()?;
+                Self::AttackRefused {
+                    reason: AttackRefusal::from_code(code).ok_or(DecodeError::MalformedPayload)?,
+                }
+            }
+            opcode::EXPERIENCE_GAINED => {
+                let mut reader = Reader::new(payload);
+                let amount = reader.u64()?;
+                let level = reader.u8()?;
+                reader.finish()?;
+                Self::ExperienceGained { amount, level }
+            }
             other => return Err(DecodeError::UnknownOpcode(other)),
         };
         Ok((message, consumed))
@@ -325,6 +511,8 @@ mod tests {
                 x: i32::MIN,
                 y: i32::MAX,
             },
+            ClientMessage::Attack { target: u64::MAX },
+            ClientMessage::Respawn,
         ]
     }
 
@@ -352,7 +540,58 @@ mod tests {
             },
             ServerMessage::EntityVanished { entity_id: 9 },
             ServerMessage::MoveRejected { x: 5, y: -5 },
+            ServerMessage::DamageDealt {
+                attacker: 1,
+                target: 2,
+                damage: u32::MAX,
+                remaining_health: 0,
+            },
+            ServerMessage::EntityDied {
+                entity: 2,
+                killer: 1,
+            },
+            ServerMessage::EntityRespawned {
+                entity: 2,
+                x: -7,
+                y: 7,
+                health: 250,
+            },
+            ServerMessage::AttackRefused {
+                reason: AttackRefusal::OutOfRange,
+            },
+            ServerMessage::ExperienceGained {
+                amount: u64::MAX,
+                level: 120,
+            },
         ]
+    }
+
+    #[test]
+    fn tous_les_motifs_de_refus_font_un_aller_retour_fidele() {
+        for reason in [
+            AttackRefusal::OutOfRange,
+            AttackRefusal::TooSoon,
+            AttackRefusal::AttackerDown,
+            AttackRefusal::TargetDown,
+            AttackRefusal::SelfTarget,
+            AttackRefusal::NoSuchTarget,
+        ] {
+            let bytes = ServerMessage::AttackRefused { reason }.encode();
+            assert_eq!(
+                ServerMessage::decode(&bytes).unwrap().0,
+                ServerMessage::AttackRefused { reason }
+            );
+        }
+    }
+
+    #[test]
+    fn un_motif_de_refus_inconnu_est_rejete() {
+        // Le code 0 n'est attribue a aucun motif : un serveur plus recent qui en
+        // ajouterait un ne doit pas etre interprete de travers par ce client.
+        assert_eq!(
+            ServerMessage::decode(&frame(opcode::ATTACK_REFUSED, &[0])),
+            Err(DecodeError::MalformedPayload)
+        );
     }
 
     #[test]

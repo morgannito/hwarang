@@ -7,8 +7,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
 
-use hwarang_domain::{CellCoord, Grid, MoveVerdict, MovementRule, Position};
-use hwarang_protocol::{EntityId, ServerMessage};
+use hwarang_domain::{
+    AttackProfile, AttackRejection, Attributes, CellCoord, Character, CharacterId, CombatRule,
+    DefenseProfile, Engagement, Grid, MoveVerdict, MovementRule, Position, ProgressionCurve,
+    Resistance, experience_reward, resolve_attack,
+};
+use hwarang_protocol::{AttackRefusal, EntityId, ServerMessage};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Rayon de perception, identique pour toutes les entites.
@@ -24,9 +28,52 @@ type Outbox = UnboundedSender<ServerMessage>;
 struct Entity {
     position: Position,
     rule: MovementRule,
+    combat: CombatRule,
+    character: Character,
     outbox: Outbox,
     /// Entites actuellement percues. Maintenu symetriquement.
     visible: HashSet<EntityId>,
+}
+
+impl Entity {
+    fn is_alive(&self) -> bool {
+        self.character.is_alive()
+    }
+
+    fn attack_profile(&self) -> AttackProfile {
+        // Statistique derivee, jamais stockee : elle ne peut pas se
+        // desynchroniser des attributs qui la produisent.
+        AttackProfile::new(BASE_ATTACK + u32::from(self.character.attributes().strength) * 5)
+    }
+
+    fn defense_profile(&self) -> DefenseProfile {
+        DefenseProfile::new(u32::from(self.character.attributes().dexterity) * 10)
+    }
+}
+
+/// Puissance de base, avant contribution des attributs.
+const BASE_ATTACK: u32 = 120;
+
+/// Attributs de depart d'un joueur.
+///
+/// En dur pour l'instant : la creation de personnage arrive avec la persistance.
+fn starting_attributes() -> Attributes {
+    Attributes {
+        strength: 10,
+        dexterity: 8,
+        vitality: 10,
+        intellect: 5,
+    }
+}
+
+const fn refusal_of(rejection: AttackRejection) -> AttackRefusal {
+    match rejection {
+        AttackRejection::OutOfRange { .. } => AttackRefusal::OutOfRange,
+        AttackRejection::TooSoon { .. } => AttackRefusal::TooSoon,
+        AttackRejection::AttackerDown => AttackRefusal::AttackerDown,
+        AttackRejection::TargetDown => AttackRefusal::TargetDown,
+        AttackRejection::SelfTarget => AttackRefusal::SelfTarget,
+    }
 }
 
 #[derive(Default)]
@@ -80,6 +127,12 @@ impl World {
             Entity {
                 position,
                 rule: MovementRule::running(),
+                combat: CombatRule::melee(),
+                character: Character::create(
+                    CharacterId::new(id),
+                    starting_attributes(),
+                    ProgressionCurve::DEFAULT,
+                ),
                 outbox,
                 visible: HashSet::new(),
             },
@@ -118,6 +171,21 @@ impl World {
         };
         let from = entity.position;
 
+        // Un mort ne se deplace pas. Le refus rappelle sa position, sinon un
+        // client qui continue d'envoyer des deplacements derive silencieusement
+        // et reapparait ailleurs.
+        if !entity.is_alive() {
+            send(
+                &state,
+                id,
+                ServerMessage::MoveRejected {
+                    x: from.x,
+                    y: from.y,
+                },
+            );
+            return;
+        }
+
         if let MoveVerdict::TooFast { .. } = entity.rule.verify(from, target, elapsed_ms) {
             // Le serveur reaffirme sa position : le client se resynchronise
             // sans aller-retour supplementaire.
@@ -136,20 +204,172 @@ impl World {
             entity.position = target;
         }
 
-        if self.grid.crosses_cell(from, target) {
-            let (before, after) = (self.grid.cell_of(from), self.grid.cell_of(target));
-            if let Some(cell) = state.cells.get_mut(&before) {
-                cell.remove(&id);
-                if cell.is_empty() {
-                    // Sans ce retrait, une carte parcourue longtemps accumule
-                    // indefiniment des cellules vides.
-                    state.cells.remove(&before);
-                }
+        self.reindex(&mut state, id, from, target);
+        self.refresh_visibility(&mut state, id);
+    }
+
+    /// Deplace une entite d'une cellule a l'autre dans l'index spatial.
+    fn reindex(&self, state: &mut State, id: EntityId, from: Position, to: Position) {
+        if !self.grid.crosses_cell(from, to) {
+            return;
+        }
+        let (before, after) = (self.grid.cell_of(from), self.grid.cell_of(to));
+        if let Some(cell) = state.cells.get_mut(&before) {
+            cell.remove(&id);
+            if cell.is_empty() {
+                // Sans ce retrait, une carte parcourue longtemps accumule
+                // indefiniment des cellules vides.
+                state.cells.remove(&before);
             }
-            state.cells.entry(after).or_default().insert(id);
+        }
+        state.cells.entry(after).or_default().insert(id);
+    }
+
+    /// Resout une attaque revendiquee par un client.
+    ///
+    /// `elapsed_ms` est mesure par le serveur depuis la derniere attaque
+    /// *retenue*, jamais annonce par le client — meme principe que pour le
+    /// deplacement.
+    pub fn request_attack(&self, attacker_id: EntityId, target_id: EntityId, elapsed_ms: u64) {
+        let mut state = self.lock();
+
+        let Some(attacker) = state.entities.get(&attacker_id) else {
+            return;
+        };
+        let Some(target) = state.entities.get(&target_id) else {
+            // Cible absente : le refus est explicite plutot que silencieux, sinon
+            // un client desynchronise frappe dans le vide sans jamais le savoir.
+            send(
+                &state,
+                attacker_id,
+                ServerMessage::AttackRefused {
+                    reason: AttackRefusal::NoSuchTarget,
+                },
+            );
+            return;
+        };
+
+        let engagement = Engagement {
+            attacker_at: attacker.position,
+            target_at: target.position,
+            attacker_alive: attacker.is_alive(),
+            target_alive: target.is_alive(),
+            same_entity: attacker_id == target_id,
+        };
+
+        if let Err(rejection) = attacker.combat.authorize(engagement, elapsed_ms) {
+            send(
+                &state,
+                attacker_id,
+                ServerMessage::AttackRefused {
+                    reason: refusal_of(rejection),
+                },
+            );
+            return;
         }
 
+        let damage = resolve_attack(
+            attacker.attack_profile(),
+            target.defense_profile(),
+            Resistance::NONE,
+            target.character.level(),
+        );
+
+        let Some(target) = state.entities.get_mut(&target_id) else {
+            return;
+        };
+        target.character = target.character.take_damage(damage);
+        let remaining_health = target.character.vitals().current();
+        let died = !target.character.is_alive();
+
+        broadcast_around(
+            &state,
+            attacker_id,
+            target_id,
+            ServerMessage::DamageDealt {
+                attacker: attacker_id,
+                target: target_id,
+                damage,
+                remaining_health,
+            },
+        );
+
+        if died {
+            Self::on_death(&mut state, attacker_id, target_id);
+        }
+    }
+
+    /// Remet une entite en jeu a son point d'apparition.
+    pub fn request_respawn(&self, id: EntityId) {
+        let mut state = self.lock();
+        let Some(entity) = state.entities.get(&id) else {
+            return;
+        };
+        // Reapparaitre vivant remettrait les jauges a plein a volonte : le
+        // soin gratuit serait a un message d'intervalle.
+        if entity.is_alive() {
+            return;
+        }
+
+        let position = spawn_position(id);
+        let from = entity.position;
+
+        let Some(entity) = state.entities.get_mut(&id) else {
+            return;
+        };
+        entity.character = entity.character.respawn();
+        entity.position = position;
+        let health = entity.character.vitals().current();
+
+        self.reindex(&mut state, id, from, position);
+
+        // `broadcast_around` inclut deja l'entite dans ses destinataires : un
+        // `send` supplementaire lui livrerait l'evenement en double.
+        broadcast_around(
+            &state,
+            id,
+            id,
+            ServerMessage::EntityRespawned {
+                entity: id,
+                x: position.x,
+                y: position.y,
+                health,
+            },
+        );
         self.refresh_visibility(&mut state, id);
+    }
+
+    /// Applique les consequences d'une mort : annonce et recompense.
+    fn on_death(state: &mut State, killer_id: EntityId, victim_id: EntityId) {
+        let Some(victim) = state.entities.get(&victim_id) else {
+            return;
+        };
+        let reward = experience_reward(victim.character.level());
+
+        broadcast_around(
+            state,
+            killer_id,
+            victim_id,
+            ServerMessage::EntityDied {
+                entity: victim_id,
+                killer: killer_id,
+            },
+        );
+
+        let Some(killer) = state.entities.get_mut(&killer_id) else {
+            return;
+        };
+        let (grown, _) = killer.character.gain_experience(reward);
+        killer.character = grown;
+
+        send(
+            state,
+            killer_id,
+            ServerMessage::ExperienceGained {
+                amount: reward.get(),
+                level: grown.level().get(),
+            },
+        );
     }
 
     /// Retire une entite et previent ceux qui la percevaient.
@@ -271,6 +491,24 @@ fn unlink(state: &mut State, a: EntityId, b: EntityId) {
     }
 }
 
+/// Diffuse a deux entites et a tous ceux qui percoivent l'une ou l'autre.
+///
+/// L'union des deux voisinages, et non le seul voisinage de l'attaquant : un
+/// temoin place pres de la cible mais loin de l'attaquant doit voir le coup
+/// porter.
+fn broadcast_around(state: &State, first: EntityId, second: EntityId, message: ServerMessage) {
+    let mut recipients: HashSet<EntityId> = HashSet::new();
+    for id in [first, second] {
+        if let Some(entity) = state.entities.get(&id) {
+            recipients.insert(id);
+            recipients.extend(entity.visible.iter().copied());
+        }
+    }
+    for id in recipients {
+        send(state, id, message);
+    }
+}
+
 /// Un envoi qui echoue signifie que la connexion est deja fermee ; le retrait
 /// de l'entite viendra de la tache de lecture.
 fn send(state: &State, id: EntityId, message: ServerMessage) {
@@ -279,14 +517,27 @@ fn send(state: &State, id: EntityId, message: ServerMessage) {
     }
 }
 
-/// Repartit les apparitions sur une spirale carree autour de l'origine.
+/// Cote de la grille de points d'apparition.
+const SPAWN_COLUMNS: i32 = 8;
+/// Ecart entre deux points d'apparition.
+///
+/// Choisi pour que la **diagonale** de la grille reste sous [`VIEW_RADIUS_CM`] :
+/// deux arrivants doivent toujours se percevoir, sinon la zone de depart se
+/// comporte differemment selon les identifiants distribues. Un ecart de 500
+/// donnerait 4950 cm de diagonale, au-dela des 4000 cm de portee.
+const SPAWN_STEP_CM: i32 = 300;
+
+/// Repartit les apparitions sur une grille autour de l'origine.
 ///
 /// Faire apparaitre tout le monde au meme point rendrait invisible toute erreur
 /// de calcul de visibilite : chacun verrait chacun, quelle que soit la grille.
 fn spawn_position(id: EntityId) -> Position {
-    let step = 500;
-    let index = i32::try_from(id % 64).unwrap_or(0);
-    Position::new((index % 8) * step, (index / 8) * step)
+    let slots = SPAWN_COLUMNS * SPAWN_COLUMNS;
+    let index = i32::try_from(id % u64::try_from(slots).unwrap_or(1)).unwrap_or(0);
+    Position::new(
+        (index % SPAWN_COLUMNS) * SPAWN_STEP_CM,
+        (index / SPAWN_COLUMNS) * SPAWN_STEP_CM,
+    )
 }
 
 #[cfg(test)]
@@ -323,6 +574,25 @@ mod tests {
             Some(ServerMessage::WorldEntered { entity_id: 1, .. })
         ));
         assert_eq!(world.population(), 1);
+    }
+
+    #[test]
+    fn tous_les_points_d_apparition_sont_mutuellement_visibles() {
+        // Sans cette garantie, deux joueurs qui se connectent coup sur coup se
+        // voient ou non selon les identifiants qu'ils ont recus.
+        let slots = SPAWN_COLUMNS * SPAWN_COLUMNS;
+        for a in 0..slots {
+            for b in 0..slots {
+                let (first, second) = (
+                    spawn_position(u64::try_from(a).unwrap_or(0)),
+                    spawn_position(u64::try_from(b).unwrap_or(0)),
+                );
+                assert!(
+                    first.is_within(second, VIEW_RADIUS_CM),
+                    "les emplacements {a} et {b} ne se voient pas"
+                );
+            }
+        }
     }
 
     #[test]
@@ -474,5 +744,292 @@ mod tests {
         let world = World::new();
         world.request_move(404, 10, 10, 1_000);
         assert_eq!(world.population(), 0);
+    }
+
+    // --- Combat ---
+
+    /// Cadence largement satisfaite, pour isoler ce qui est teste.
+    const AT_EASE: u64 = 60_000;
+
+    fn refusal(messages: &[ServerMessage]) -> Option<AttackRefusal> {
+        messages.iter().find_map(|m| match m {
+            ServerMessage::AttackRefused { reason } => Some(*reason),
+            _ => None,
+        })
+    }
+
+    fn health_of(world: &World, id: EntityId) -> u32 {
+        world.lock().entities[&id].character.vitals().current()
+    }
+
+    /// Deux combattants au contact, journaux vides.
+    fn duel(
+        world: &World,
+    ) -> (
+        UnboundedReceiver<ServerMessage>,
+        UnboundedReceiver<ServerMessage>,
+    ) {
+        let mut first = join(world, 1);
+        let mut second = join(world, 2);
+        teleport(world, 2, spawn_position(1).x + 100, spawn_position(1).y);
+        drain(&mut first);
+        drain(&mut second);
+        (first, second)
+    }
+
+    #[test]
+    fn une_attaque_au_contact_retire_des_points_de_vie() {
+        let world = World::new();
+        let (mut attacker, _target) = duel(&world);
+        let before = health_of(&world, 2);
+
+        world.request_attack(1, 2, AT_EASE);
+
+        let after = health_of(&world, 2);
+        assert!(after < before, "aucun degat applique");
+        assert!(drain(&mut attacker).iter().any(|m| matches!(
+            m,
+            ServerMessage::DamageDealt {
+                attacker: 1,
+                target: 2,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn la_cible_est_prevenue_du_coup_qu_elle_recoit() {
+        let world = World::new();
+        let (_attacker, mut target) = duel(&world);
+
+        world.request_attack(1, 2, AT_EASE);
+
+        assert!(
+            drain(&mut target)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::DamageDealt { target: 2, .. }))
+        );
+    }
+
+    #[test]
+    fn une_cible_hors_d_allonge_est_refusee() {
+        let world = World::new();
+        let (mut attacker, _target) = duel(&world);
+        teleport(&world, 2, 3_000, 0);
+        drain(&mut attacker);
+
+        world.request_attack(1, 2, AT_EASE);
+
+        assert_eq!(
+            refusal(&drain(&mut attacker)),
+            Some(AttackRefusal::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn la_cadence_bloque_les_attaques_en_rafale() {
+        let world = World::new();
+        let (mut attacker, _target) = duel(&world);
+
+        world.request_attack(1, 2, AT_EASE);
+        drain(&mut attacker);
+        world.request_attack(1, 2, 5);
+
+        assert_eq!(refusal(&drain(&mut attacker)), Some(AttackRefusal::TooSoon));
+    }
+
+    #[test]
+    fn une_rafale_refusee_n_inflige_aucun_degat() {
+        let world = World::new();
+        let (_attacker, _target) = duel(&world);
+
+        world.request_attack(1, 2, AT_EASE);
+        let after_first = health_of(&world, 2);
+        for _ in 0..50 {
+            world.request_attack(1, 2, 1);
+        }
+
+        assert_eq!(
+            health_of(&world, 2),
+            after_first,
+            "la rafale a traverse la cadence"
+        );
+    }
+
+    #[test]
+    fn se_prendre_pour_cible_est_refuse() {
+        let world = World::new();
+        let (mut attacker, _target) = duel(&world);
+
+        world.request_attack(1, 1, AT_EASE);
+
+        assert_eq!(
+            refusal(&drain(&mut attacker)),
+            Some(AttackRefusal::SelfTarget)
+        );
+    }
+
+    #[test]
+    fn attaquer_une_entite_absente_est_refuse_explicitement() {
+        let world = World::new();
+        let (mut attacker, _target) = duel(&world);
+
+        world.request_attack(1, 999, AT_EASE);
+
+        assert_eq!(
+            refusal(&drain(&mut attacker)),
+            Some(AttackRefusal::NoSuchTarget)
+        );
+    }
+
+    /// Frappe jusqu'a la mort de la cible, en respectant la cadence.
+    fn strike_until_dead(world: &World, attacker: EntityId, target: EntityId) -> usize {
+        for blow in 1..500 {
+            world.request_attack(attacker, target, AT_EASE);
+            if !world.lock().entities[&target].is_alive() {
+                return blow;
+            }
+        }
+        panic!("la cible n'est jamais tombee");
+    }
+
+    #[test]
+    fn la_cible_finit_par_tomber_et_la_mort_est_annoncee() {
+        let world = World::new();
+        let (mut attacker, mut target) = duel(&world);
+
+        strike_until_dead(&world, 1, 2);
+
+        let seen_by_target = drain(&mut target);
+        assert!(seen_by_target.iter().any(|m| matches!(
+            m,
+            ServerMessage::EntityDied {
+                entity: 2,
+                killer: 1
+            }
+        )));
+        assert!(
+            drain(&mut attacker)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::EntityDied { entity: 2, .. }))
+        );
+    }
+
+    #[test]
+    fn eliminer_une_cible_rapporte_de_l_experience() {
+        let world = World::new();
+        let (mut attacker, _target) = duel(&world);
+
+        strike_until_dead(&world, 1, 2);
+
+        assert!(
+            drain(&mut attacker).iter().any(
+                |m| matches!(m, ServerMessage::ExperienceGained { amount, .. } if *amount > 0)
+            )
+        );
+    }
+
+    #[test]
+    fn s_acharner_sur_un_cadavre_est_refuse() {
+        let world = World::new();
+        let (mut attacker, _target) = duel(&world);
+        strike_until_dead(&world, 1, 2);
+        drain(&mut attacker);
+
+        world.request_attack(1, 2, AT_EASE);
+
+        assert_eq!(
+            refusal(&drain(&mut attacker)),
+            Some(AttackRefusal::TargetDown)
+        );
+    }
+
+    #[test]
+    fn un_mort_ne_riposte_pas() {
+        let world = World::new();
+        let (_attacker, mut target) = duel(&world);
+        strike_until_dead(&world, 1, 2);
+        drain(&mut target);
+
+        world.request_attack(2, 1, AT_EASE);
+
+        assert_eq!(
+            refusal(&drain(&mut target)),
+            Some(AttackRefusal::AttackerDown)
+        );
+    }
+
+    #[test]
+    fn un_mort_ne_se_deplace_pas() {
+        let world = World::new();
+        let (_attacker, mut target) = duel(&world);
+        strike_until_dead(&world, 1, 2);
+        let position = world.lock().entities[&2].position;
+        drain(&mut target);
+
+        teleport(&world, 2, 9_000, 9_000);
+
+        assert_eq!(world.lock().entities[&2].position, position);
+        assert!(
+            drain(&mut target)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::MoveRejected { .. }))
+        );
+    }
+
+    #[test]
+    fn reapparaitre_restaure_les_points_de_vie_et_previent_les_temoins() {
+        let world = World::new();
+        let (mut attacker, mut target) = duel(&world);
+        strike_until_dead(&world, 1, 2);
+        drain(&mut attacker);
+        drain(&mut target);
+
+        world.request_respawn(2);
+
+        let entity = &world.lock().entities[&2];
+        assert!(entity.is_alive());
+        assert_eq!(
+            entity.character.vitals().current(),
+            entity.character.vitals().max()
+        );
+        assert!(
+            drain(&mut attacker)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::EntityRespawned { entity: 2, .. })),
+            "le temoin n'a pas ete prevenu du retour"
+        );
+    }
+
+    #[test]
+    fn la_reapparition_n_est_annoncee_qu_une_fois_a_l_interesse() {
+        let world = World::new();
+        let (_attacker, mut target) = duel(&world);
+        strike_until_dead(&world, 1, 2);
+        drain(&mut target);
+
+        world.request_respawn(2);
+
+        let announcements = drain(&mut target)
+            .iter()
+            .filter(|m| matches!(m, ServerMessage::EntityRespawned { .. }))
+            .count();
+        assert_eq!(announcements, 1, "evenement livre en double");
+    }
+
+    #[test]
+    fn reapparaitre_vivant_ne_soigne_pas() {
+        let world = World::new();
+        let (_attacker, _target) = duel(&world);
+        world.request_attack(1, 2, AT_EASE);
+        let wounded = health_of(&world, 2);
+
+        world.request_respawn(2);
+
+        assert_eq!(
+            health_of(&world, 2),
+            wounded,
+            "la reapparition sert de soin gratuit"
+        );
     }
 }

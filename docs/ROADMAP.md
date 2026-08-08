@@ -22,31 +22,17 @@ Positions entières, validation de déplacement côté serveur, grille d'intér�
 diffusion aux voisins, apparition/disparition au champ de vision.
 **Démo :** `scripts/two_clients.py`
 
+### J2 — Combat branché
+`combat` et `character` étaient testés mais appelés par aucun chemin de code.
+Portée, cadence, mort, expérience, réapparition — toutes vérifiées côté serveur.
+**Démo :** `scripts/combat.py`
+
 ---
 
 ## Phase 1 — Faire du serveur un jeu
 
 Technique pure, solo, effort prévisible. C'est la partie où le projet avance
 vite, et il faut en profiter pour la finir proprement.
-
-### J2 — Combat branché · **petit**
-
-Le contexte `combat` existe et est testé, mais **aucun chemin de code ne
-l'appelle**. Idem pour `character`. Ce jalon relie ces îlots au serveur.
-
-- protocole : `Attack { target }`, `DamageDealt`, `Died`, `Respawned`
-- domaine : portée d'attaque, cadence maximale — même logique d'autorité que le
-  déplacement, un client ne doit pas pouvoir enchaîner 100 attaques par seconde
-- serveur : résolution, application aux `Vitals`, diffusion aux témoins
-- gain d'expérience à l'élimination
-
-**Fini quand :** `scripts/combat.py` montre deux clients s'affrontant jusqu'à la
-mort de l'un, une attaque hors de portée refusée, et une cadence excessive
-rejetée.
-
-**Pourquoi en premier :** tant que ce n'est pas fait, l'ADR-0003 est une
-intention et non un comportement. Empiler un client par-dessus du domaine mort
-ne ferait qu'agrandir la dette.
 
 ### J3 — Visualiseur Godot · **moyen**
 
@@ -135,3 +121,20 @@ qui vient après ajoute de la matière, pas des fondations.
 | Origine des assets | non tranchée — à décider avant J3 |
 | Base de données | SQLite pour J4, PostgreSQL si la charge le justifie |
 | Chiffrement du transport | absent ; à traiter avant toute exposition hors réseau local |
+
+## Anomalies connues
+
+**Démonstrations enchaînées sur un même serveur.** Lancer `smoke`, `two_clients`
+et `combat` à la suite contre un seul serveur échoue environ une fois sur cinq.
+Isolées, elles passent systématiquement (12/12 pour `two_clients` seule, 15/15
+avec un serveur neuf par démonstration).
+
+La cause n'est pas identifiée. L'hypothèse de travail est un reliquat d'état
+entre scénarios — entités en cours de retrait, identifiants déjà distribués —
+mais elle n'a pas été confirmée : les tentatives de reproduction ciblée
+(`combat` puis `two_clients`, cinq fois) n'ont rien déclenché.
+
+Contourné en CI par un serveur neuf par démonstration, ce qui est de toute façon
+la bonne pratique. **Le contournement n'est pas un diagnostic** : si un
+comportement dépend de l'état laissé par une session précédente, c'est une
+propriété du serveur qu'il faudra comprendre avant d'ajouter la persistance.

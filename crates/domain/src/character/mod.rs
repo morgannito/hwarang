@@ -179,6 +179,19 @@ impl Character {
             ..self
         }
     }
+
+    /// Remet le personnage en jeu, jauges pleines.
+    ///
+    /// Ni palier ni experience ne sont retires : une penalite de mort est une
+    /// decision d'equilibrage, pas une consequence mecanique — et l'introduire
+    /// ici la rendrait invisible depuis les regles de jeu.
+    #[must_use]
+    pub fn respawn(self) -> Self {
+        Self {
+            vitals: Vitals::full(self.attributes.max_health(self.level)).unwrap_or(self.vitals),
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +280,19 @@ mod tests {
         let character = hero();
         let dead = character.take_damage(character.vitals().max());
         assert!(!dead.is_alive());
+    }
+
+    #[test]
+    fn reapparaitre_restaure_les_jauges_sans_toucher_a_la_progression() {
+        let (grown, _) = hero().gain_experience(Experience::new(100_000));
+        let dead = grown.take_damage(u32::MAX);
+        assert!(!dead.is_alive());
+
+        let revived = dead.respawn();
+        assert!(revived.is_alive());
+        assert_eq!(revived.vitals().current(), revived.vitals().max());
+        assert_eq!(revived.level(), grown.level());
+        assert_eq!(revived.experience(), grown.experience());
     }
 
     #[test]

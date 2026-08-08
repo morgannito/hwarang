@@ -44,26 +44,40 @@ jobs:
 
       # Lancement et verification dans le meme step : un process detache ne
       # survit pas de facon fiable d'un step a l'autre.
-      # Le smoke test rejoue le format binaire sans passer par hwarang-protocol,
-      # donc il verifie ce qui sort reellement sur le fil, pas la coherence interne.
-      - name: Smoke
+      #
+      # Un serveur neuf par demonstration. Enchainer les scenarios sur un meme
+      # monde les rend dependants de l'etat laisse par le precedent — entites en
+      # cours de deconnexion, identifiants deja distribues — et introduit des
+      # echecs intermittents qui ne disent rien du code teste.
+      #
+      # Les scripts rejouent le format binaire sans passer par hwarang-protocol,
+      # donc ils verifient ce qui sort reellement sur le fil.
+      - name: Demonstrations
         run: |
           set -euo pipefail
-          HWARANG_BIND=127.0.0.1:13000 ./target/release/hwarang-server &
-          server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
 
-          python3 - <<'WAIT'
+          run_demo() {
+            local script="$1" port="$2"
+            echo "--- $script ---"
+            HWARANG_BIND="127.0.0.1:$port" ./target/release/hwarang-server &
+            local pid=$!
+            python3 - "$port" <<'WAIT'
           import socket, sys, time
+          port = int(sys.argv[1])
           deadline = time.monotonic() + 15
           while time.monotonic() < deadline:
               try:
-                  socket.create_connection(("127.0.0.1", 13000), timeout=1).close()
+                  socket.create_connection(("127.0.0.1", port), timeout=1).close()
                   sys.exit(0)
               except OSError:
                   time.sleep(0.2)
           sys.exit("le serveur n'a pas ouvert le port")
           WAIT
+            python3 "scripts/$script" 127.0.0.1 "$port"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          }
 
-          python3 scripts/smoke.py 127.0.0.1 13000
-          python3 scripts/two_clients.py 127.0.0.1 13000
+          run_demo smoke.py 13001
+          run_demo two_clients.py 13002
+          run_demo combat.py 13003

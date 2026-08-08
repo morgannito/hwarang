@@ -42,6 +42,10 @@ l'écosystème. Ici le client *propose*, le serveur vérifie que la distance est
 compatible avec le temps écoulé (mesuré côté serveur), et en cas de refus
 renvoie sa propre position pour resynchroniser sans aller-retour.
 
+**Autorité serveur sur l'offensive aussi.** Portée et cadence sont vérifiées
+côté serveur, avec le temps mesuré par le serveur. Un client modifié qui envoie
+mille attaques par seconde en voit passer une.
+
 **Domaine sans I/O.** `hwarang-domain` n'a aucune dépendance : chaque règle de
 jeu est testable sans lancer un serveur ni une base de données.
 
@@ -62,35 +66,43 @@ La dépendance ne va que dans un sens : `server → protocol → domain`.
 ## Démarrer
 
 ```bash
-cargo test --workspace          # 82 tests
+cargo test --workspace          # 112 tests
 cargo run -p hwarang-server     # écoute sur 127.0.0.1:13000
 HWARANG_BIND=0.0.0.0:13000 cargo run -p hwarang-server
 ```
 
-Deux vérifications bout en bout, contre un serveur en cours d'exécution. Les
-deux réimplémentent le format binaire au lieu de réutiliser `hwarang-protocol` :
-un test qui partagerait l'encodage du serveur ne prouverait rien sur ce qui
-circule réellement.
+Trois vérifications bout en bout, contre un serveur en cours d'exécution. Elles
+réimplémentent le format binaire au lieu de réutiliser `hwarang-protocol` : un
+test qui partagerait l'encodage du serveur ne prouverait rien sur ce qui circule
+réellement.
 
 ```bash
 python3 scripts/smoke.py 127.0.0.1 13000         # protocole, cas hostiles
 python3 scripts/two_clients.py 127.0.0.1 13000   # diffusion entre deux joueurs
+python3 scripts/combat.py 127.0.0.1 13000        # portée, cadence, mort, XP
 ```
+
+Chacune attend un monde vierge : les lancer à la suite sur un même serveur les
+rend dépendantes de l'état laissé par la précédente. La CI démarre un serveur
+neuf par démonstration.
 
 ## État
 
 | Composant | État |
 |---|---|
-| Domaine : progression, jauges, combat | testé |
+| Domaine : progression, jauges, mitigation, engagement | testé |
 | Domaine : positions, mouvement, grille d'intérêt | testé |
 | Protocole binaire + machine à états de session | testé |
-| Serveur TCP, registre d'entités, diffusion aux voisins | fonctionnel |
+| Serveur : registre d'entités, diffusion, combat | fonctionnel |
 | Persistance | à faire |
 | Client (Godot 4) | à faire |
 
 Ce qui marche aujourd'hui : deux clients se connectent, se découvrent, se voient
-bouger en temps réel, disparaissent l'un de l'autre en sortant du champ de
-vision, et un déplacement impossible est refusé puis corrigé par le serveur.
+bouger en temps réel, disparaissent l'un de l'autre hors du champ de vision,
+s'affrontent au corps à corps jusqu'à la mort de l'un, qui gagne de
+l'expérience et peut réapparaître. Déplacement trop rapide, attaque hors de
+portée, rafale d'attaques et acharnement sur un cadavre sont refusés par le
+serveur, avec le motif.
 
 ## Suite
 

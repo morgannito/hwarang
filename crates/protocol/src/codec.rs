@@ -25,6 +25,10 @@ impl<'a> Reader<'a> {
         head.try_into().map_err(|_| DecodeError::MalformedPayload)
     }
 
+    pub(crate) fn u8(&mut self) -> Result<u8, DecodeError> {
+        self.take::<1>().map(|[byte]| byte)
+    }
+
     pub(crate) fn u16(&mut self) -> Result<u16, DecodeError> {
         self.take::<2>().map(u16::from_be_bytes)
     }
@@ -58,6 +62,11 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
+    pub(crate) fn u8(mut self, value: u8) -> Self {
+        self.bytes.push(value);
+        self
+    }
+
     pub(crate) fn u16(mut self, value: u16) -> Self {
         self.bytes.extend_from_slice(&value.to_be_bytes());
         self

@@ -68,9 +68,9 @@ async fn serve(stream: TcpStream, mut session: Session, world: &World) -> std::i
 
     let mut buffer = Vec::with_capacity(MAX_FRAME_LEN);
     let mut chunk = [0_u8; 1024];
-    // Horodatage serveur du dernier deplacement retenu : le client n'a aucune
-    // prise sur la mesure du temps qui borne sa vitesse.
-    let mut last_move = Instant::now();
+    // Horodatages serveur des dernieres actions retenues : le client n'a aucune
+    // prise sur la mesure du temps qui borne sa vitesse et sa cadence.
+    let mut clock = ActionClock::new();
 
     loop {
         tokio::select! {
@@ -103,7 +103,7 @@ async fn serve(stream: TcpStream, mut session: Session, world: &World) -> std::i
                         }
                         Reaction::Close => return Ok(()),
                         Reaction::Perform(command) => {
-                            perform(command, &session, world, &outbox, &mut last_move);
+                            perform(command, &session, world, &outbox, &mut clock);
                         }
                     }
                 }
@@ -112,33 +112,67 @@ async fn serve(stream: TcpStream, mut session: Session, world: &World) -> std::i
     }
 }
 
+/// Horodatages des dernieres actions d'une connexion.
+///
+/// Un compteur par nature d'action : un joueur qui court ne doit pas voir sa
+/// cadence d'attaque remise a zero, et inversement.
+struct ActionClock {
+    last_move: Instant,
+    last_attack: Instant,
+}
+
+impl ActionClock {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            last_move: now,
+            last_attack: now,
+        }
+    }
+
+    /// Temps ecoule depuis `marker`, puis remise a zero.
+    ///
+    /// La remise a zero est inconditionnelle, y compris quand l'action est
+    /// refusee : sinon un client rejete accumulerait du temps et s'offrirait
+    /// ensuite un grand saut ou une salve d'attaques.
+    fn take(marker: &mut Instant) -> u64 {
+        let now = Instant::now();
+        let elapsed = u64::try_from(now.duration_since(*marker).as_millis()).unwrap_or(u64::MAX);
+        *marker = now;
+        elapsed
+    }
+}
+
 fn perform(
     command: WorldCommand,
     session: &Session,
     world: &World,
     outbox: &UnboundedSender<ServerMessage>,
-    last_move: &mut Instant,
+    clock: &mut ActionClock,
 ) {
+    let id = session.entity_id();
     match command {
         WorldCommand::Enter => {
-            let at = world.enter(session.entity_id(), outbox.clone());
-            *last_move = Instant::now();
+            let at = world.enter(id, outbox.clone());
+            *clock = ActionClock::new();
             println!(
-                "entite {} apparait en ({}, {}), {} en jeu",
-                session.entity_id(),
+                "entite {id} apparait en ({}, {}), {} en jeu",
                 at.x,
                 at.y,
                 world.population()
             );
         }
         WorldCommand::Move { x, y } => {
-            let now = Instant::now();
-            let elapsed_ms =
-                u64::try_from(now.duration_since(*last_move).as_millis()).unwrap_or(u64::MAX);
-            world.request_move(session.entity_id(), x, y, elapsed_ms);
-            // L'horloge repart meme si le deplacement est refuse : sinon un
-            // client rejete accumulerait du temps et s'offrirait un grand saut.
-            *last_move = now;
+            let elapsed = ActionClock::take(&mut clock.last_move);
+            world.request_move(id, x, y, elapsed);
+        }
+        WorldCommand::Attack { target } => {
+            let elapsed = ActionClock::take(&mut clock.last_attack);
+            world.request_attack(id, target, elapsed);
+        }
+        WorldCommand::Respawn => {
+            world.request_respawn(id);
+            *clock = ActionClock::new();
         }
     }
 }

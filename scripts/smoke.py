@@ -18,7 +18,9 @@ HANDSHAKE_ACCEPTED = 0x81
 HANDSHAKE_REJECTED = 0x82
 PONG = 0x83
 
-PROTOCOL_VERSION = 1
+# Doit suivre PROTOCOL_VERSION cote Rust. Un oubli se manifeste par un
+# HandshakeRejected — ce qui est precisement le comportement attendu du serveur.
+PROTOCOL_VERSION = 3
 
 
 def frame(opcode: int, payload: bytes) -> bytes:

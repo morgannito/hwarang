@@ -14,7 +14,8 @@ import struct
 import sys
 import time
 
-PROTOCOL_VERSION = 2
+# Doit suivre PROTOCOL_VERSION cote Rust.
+PROTOCOL_VERSION = 3
 
 HANDSHAKE, PING, ENTER_WORLD, MOVE = 0x01, 0x02, 0x03, 0x04
 HANDSHAKE_ACCEPTED = 0x81
@@ -35,7 +36,12 @@ class Client:
     def __init__(self, label: str, host: str, port: int) -> None:
         self.label = label
         self.sock = socket.create_connection((host, port), timeout=3)
-        self.entity_id: int | None = None
+        self.entity_id = 0
+        # Position reelle, lue du serveur. Le point d'apparition depend de
+        # l'identifiant d'entite : coder une position en dur rend la demo
+        # dependante du nombre de connexions deja servies.
+        self.x = 0
+        self.y = 0
 
     def send(self, opcode: int, payload: bytes = b"") -> None:
         self.sock.sendall(struct.pack(">H", len(payload) + 1) + bytes([opcode]) + payload)
@@ -53,6 +59,12 @@ class Client:
         body = self.sock.recv(length)
         return body[0], body[1:]
 
+    def expect(self) -> tuple[int, bytes]:
+        """Lit une trame la ou une reponse est certaine, ou echoue."""
+        frame = self.receive()
+        assert frame is not None, "le serveur n'a pas repondu"
+        return frame
+
     def drain(self) -> list[tuple[int, bytes]]:
         frames = []
         while (frame := self.receive()) is not None:
@@ -69,17 +81,18 @@ class Client:
 
     def handshake_and_enter(self) -> None:
         self.send(HANDSHAKE, struct.pack(">H", PROTOCOL_VERSION))
-        opcode, payload = self.receive()
+        opcode, _ = self.expect()
         assert opcode == HANDSHAKE_ACCEPTED, f"handshake refuse (0x{opcode:02x})"
 
         self.send(ENTER_WORLD)
-        opcode, payload = self.receive()
+        opcode, payload = self.expect()
         assert opcode == WORLD_ENTERED, f"entree refusee (0x{opcode:02x})"
-        self.entity_id, x, y = struct.unpack(">Qii", payload)
-        print(f"  [{self.label}] entite {self.entity_id} apparait en ({x}, {y})")
+        self.entity_id, self.x, self.y = struct.unpack(">Qii", payload)
+        print(f"  [{self.label}] entite {self.entity_id} apparait en ({self.x}, {self.y})")
 
     def move(self, x: int, y: int) -> None:
         self.send(MOVE, struct.pack(">ii", x, y))
+        self.x, self.y = x, y
 
     def close(self) -> None:
         self.sock.close()
@@ -116,26 +129,42 @@ def main() -> int:
     assert ENTITY_APPEARED in seen_by_bob, "bob n'a pas vu alice apparaitre"
 
     print("\n3. Bob avance de 2 m ; alice doit le voir bouger")
-    bob.move(700, 0)
+    bob.move(bob.x + 200, bob.y)
     time.sleep(0.2)
     assert ENTITY_MOVED in alice.report(), "le deplacement de bob n'a pas ete diffuse"
     bob.drain()
 
     print("\n4. Bob tente un saut de 10 km : le serveur refuse et le replace")
+    target = bob.x
     bob.move(1_000_000, 0)
+    bob.x, bob.y = target, bob.y  # le serveur a refuse : la position n'a pas bouge
     time.sleep(0.2)
     assert MOVE_REJECTED in bob.report(), "le saut n'a pas ete refuse"
-    assert not alice.report(), "alice a percu un deplacement refuse"
+
+    # L'assertion porte sur les deplacements de bob, pas sur le silence total :
+    # d'autres entites peuvent entrer ou sortir du champ d'alice au meme moment,
+    # et exiger une boite vide rendrait la demo dependante du voisinage.
+    moves_of_bob = [
+        opcode
+        for opcode, payload in alice.drain()
+        if opcode == ENTITY_MOVED and struct.unpack(">Qii", payload)[0] == bob.entity_id
+    ]
+    assert not moves_of_bob, "alice a percu un deplacement pourtant refuse"
 
     print("\n5. Bob s'eloigne par petits pas jusqu'a sortir du champ de vision")
-    x = 700
-    for _ in range(90):
-        x += 300
-        bob.move(x, 0)
-        time.sleep(0.05)
+    # La pause est explicite et non deleguee au `drain` : celui-ci rend la main
+    # sans attendre des qu'une trame patiente, l'intervalle se resserre et le
+    # serveur refuse les pas — bob n'avancerait jamais assez loin.
+    # 300 cm exigent 357 ms a la vitesse de course, marge comprise.
+    for step in range(1, 31):
+        time.sleep(0.5)
+        bob.move(bob.x + 300, bob.y)
         bob.drain()
-    time.sleep(0.2)
-    assert ENTITY_VANISHED in alice.report(), "bob n'a jamais disparu du champ"
+        if ENTITY_VANISHED in [opcode for opcode, _ in alice.drain()]:
+            print(f"  [alice] bob sort du champ apres {step} pas")
+            break
+    else:
+        raise AssertionError("bob n'a jamais disparu du champ")
 
     print("\n6. Bob se deconnecte")
     bob.close()
