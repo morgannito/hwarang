@@ -27,6 +27,14 @@ diffusion aux voisins, apparition/disparition au champ de vision.
 Portée, cadence, mort, expérience, réapparition — toutes vérifiées côté serveur.
 **Démo :** `scripts/combat.py`
 
+### J4 — Persistance
+Comptes avec mots de passe hachés (Argon2), personnages sauvegardés en SQLite.
+Le nom de compte est insensible à la casse et restreint à l'ASCII : accepter
+l'Unicode entier ouvrirait l'usurpation par homographie. Un compte inexistant et
+un mot de passe faux donnent la même erreur, après le même temps de calcul —
+sinon l'écart suffit à énumérer les comptes du serveur.
+**Démo :** `scripts/persistence.py`, en deux phases autour d'un redémarrage.
+
 ---
 
 ## Phase 1 — Faire du serveur un jeu
@@ -47,19 +55,6 @@ voit ; un client bricolé pour tricher se fait replacer visiblement.
 
 **Inconnue non levée :** lire du binaire big-endian depuis GDScript
 (`PackedByteArray`, lectures partielles). Non vérifié à ce jour.
-
-### J4 — Persistance · **moyen**
-
-Aujourd'hui tout disparaît au redémarrage, et `session_id` est un compteur : il
-n'y a **aucune authentification**.
-
-- comptes avec mot de passe haché (Argon2)
-- personnages sauvegardés : position, niveau, expérience, jauges
-- SQLite pour commencer — un fichier, pas de serveur à administrer, migration
-  vers PostgreSQL possible plus tard sans changer le domaine
-
-**Fini quand :** on se connecte, on gagne un niveau, on redémarre le serveur, on
-se reconnecte et le niveau est toujours là.
 
 ### J5 — Monde peuplé · **grand**
 
@@ -119,7 +114,7 @@ qui vient après ajoute de la matière, pas des fondations.
 |---|---|
 | Dépôt public ou privé | privé ; la CI Actions est bloquée côté facturation, le passage en public la débloquerait (et l'ADR-0001 le permet) |
 | Origine des assets | non tranchée — à décider avant J3 |
-| Base de données | SQLite pour J4, PostgreSQL si la charge le justifie |
+| Base de données | SQLite en place ; PostgreSQL si la charge le justifie, le domaine n'en dépend pas |
 | Chiffrement du transport | absent ; à traiter avant toute exposition hors réseau local |
 
 ## Audit — ce qui a été trouvé et corrigé

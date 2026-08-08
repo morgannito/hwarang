@@ -12,16 +12,19 @@ Usage : scripts/combat.py [hote] [port]
 """
 
 import math
+import os
 import socket
 import struct
 import sys
 import time
 
 # Doit suivre PROTOCOL_VERSION cote Rust.
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 HANDSHAKE, PING, ENTER_WORLD, MOVE, ATTACK, RESPAWN = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
+REGISTER = 0x07
 HANDSHAKE_ACCEPTED, WORLD_ENTERED = 0x81, 0x84
+AUTHENTICATED = 0x8E
 MOVE_REJECTED = 0x88
 DAMAGE_DEALT, ENTITY_DIED = 0x89, 0x8A
 ENTITY_RESPAWNED, ATTACK_REFUSED, EXPERIENCE_GAINED = 0x8B, 0x8C, 0x8D
@@ -41,6 +44,16 @@ COOLDOWN = 1.05
 MELEE_RANGE_CM = 200
 # Pas de deplacement, compatible avec la vitesse de course.
 STEP_CM = 300
+
+
+# Distingue deux executions simultanees sur des serveurs differents.
+PORT_TAG = "0"
+
+
+def encode_credentials(username: str, password: str) -> bytes:
+    """Deux chaines precedees chacune de leur longueur en octets."""
+    name, secret = username.encode(), password.encode()
+    return struct.pack(">H", len(name)) + name + struct.pack(">H", len(secret)) + secret
 
 
 class Client:
@@ -106,6 +119,15 @@ class Client:
         self.send(HANDSHAKE, struct.pack(">H", PROTOCOL_VERSION))
         opcode, _ = self.expect()
         assert opcode == HANDSHAKE_ACCEPTED, f"handshake refuse (0x{opcode:02x})"
+
+        # Compte jetable, unique a cette execution : la demo doit partir d'un
+        # personnage neuf et en pleine sante, pas de celui qu'une execution
+        # precedente a laisse a terre.
+        account = f"{self.label}-{os.getpid()}-{PORT_TAG}"
+        self.send(REGISTER, encode_credentials(account, "mot-de-passe-jetable"))
+        opcode, _ = self.expect()
+        assert opcode == AUTHENTICATED, f"inscription refusee (0x{opcode:02x})"
+
         self.send(ENTER_WORLD)
         opcode, payload = self.expect()
         assert opcode == WORLD_ENTERED, f"entree refusee (0x{opcode:02x})"
@@ -161,8 +183,10 @@ def describe(opcode: int, payload: bytes) -> str:
 
 
 def main() -> int:
+    global PORT_TAG
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 13000
+    PORT_TAG = str(port)
 
     print(f"connexion a {host}:{port}\n")
     print("1. Deux combattants entrent dans le monde")

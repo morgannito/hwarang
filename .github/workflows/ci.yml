@@ -60,7 +60,12 @@ jobs:
           run_demo() {
             local script="$1" port="$2"
             echo "--- $script ---"
-            HWARANG_BIND="127.0.0.1:$port" ./target/release/hwarang-server &
+            # Base neuve aussi : la persistance ferait qu'une demonstration
+            # retrouverait le personnage laisse par la precedente.
+            local db
+            db="$(mktemp -d)/hwarang.sqlite"
+            HWARANG_DB="$db" HWARANG_BIND="127.0.0.1:$port" \
+              ./target/release/hwarang-server &
             local pid=$!
             python3 - "$port" <<'WAIT'
           import socket, sys, time
@@ -82,3 +87,27 @@ jobs:
           run_demo smoke.py 13001
           run_demo two_clients.py 13002
           run_demo combat.py 13003
+
+          # La persistance demande deux serveurs successifs sur la MEME base :
+          # c'est tout l'objet du test, il ne peut pas passer par `run_demo`.
+          echo "--- persistence.py ---"
+          db="$(mktemp -d)/hwarang.sqlite"
+          for phase in phase1 phase2; do
+            HWARANG_DB="$db" HWARANG_BIND=127.0.0.1:13004 \
+              ./target/release/hwarang-server &
+            pid=$!
+            python3 - <<'WAIT'
+          import socket, sys, time
+          deadline = time.monotonic() + 15
+          while time.monotonic() < deadline:
+              try:
+                  socket.create_connection(("127.0.0.1", 13004), timeout=1).close()
+                  sys.exit(0)
+              except OSError:
+                  time.sleep(0.2)
+          sys.exit("le serveur n'a pas ouvert le port")
+          WAIT
+            python3 scripts/persistence.py 127.0.0.1 13004 "$phase"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          done

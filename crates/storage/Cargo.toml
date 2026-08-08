@@ -1,0 +1,18 @@
+[package]
+name = "hwarang-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Persistance des comptes et des personnages. SQLite, sans logique de jeu."
+
+[dependencies]
+hwarang-domain.workspace = true
+argon2 = { version = "0.5.3", features = ["std"] }
+# `bundled` compile SQLite avec le binaire : pas de dependance systeme a
+# installer sur la machine de deploiement, et une version connue plutot que
+# celle, variable, de la distribution.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[lints]
+workspace = true

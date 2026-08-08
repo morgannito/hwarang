@@ -9,16 +9,19 @@ rien sur ce qui circule reellement.
 Usage : scripts/two_clients.py [hote] [port]
 """
 
+import os
 import socket
 import struct
 import sys
 import time
 
 # Doit suivre PROTOCOL_VERSION cote Rust.
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 HANDSHAKE, PING, ENTER_WORLD, MOVE = 0x01, 0x02, 0x03, 0x04
+REGISTER = 0x07
 HANDSHAKE_ACCEPTED = 0x81
+AUTHENTICATED = 0x8E
 WORLD_ENTERED, ENTITY_APPEARED = 0x84, 0x85
 ENTITY_MOVED, ENTITY_VANISHED, MOVE_REJECTED = 0x86, 0x87, 0x88
 
@@ -30,6 +33,16 @@ NAMES = {
     ENTITY_VANISHED: "EntityVanished",
     MOVE_REJECTED: "MoveRejected",
 }
+
+
+# Distingue deux executions simultanees sur des serveurs differents.
+PORT_TAG = "0"
+
+
+def encode_credentials(username: str, password: str) -> bytes:
+    """Deux chaines precedees chacune de leur longueur en octets."""
+    name, secret = username.encode(), password.encode()
+    return struct.pack(">H", len(name)) + name + struct.pack(">H", len(secret)) + secret
 
 
 class Client:
@@ -97,6 +110,13 @@ class Client:
         opcode, _ = self.expect()
         assert opcode == HANDSHAKE_ACCEPTED, f"handshake refuse (0x{opcode:02x})"
 
+        # Compte jetable, unique a cette execution : la demo doit partir d'un
+        # personnage neuf, pas de celui qu'une execution precedente a deplace.
+        account = f"{self.label}-{os.getpid()}-{PORT_TAG}"
+        self.send(REGISTER, encode_credentials(account, "mot-de-passe-jetable"))
+        opcode, _ = self.expect()
+        assert opcode == AUTHENTICATED, f"inscription refusee (0x{opcode:02x})"
+
         self.send(ENTER_WORLD)
         opcode, payload = self.expect()
         assert opcode == WORLD_ENTERED, f"entree refusee (0x{opcode:02x})"
@@ -125,8 +145,10 @@ def describe(opcode: int, payload: bytes) -> str:
 
 
 def main() -> int:
+    global PORT_TAG
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 13000
+    PORT_TAG = str(port)
 
     print(f"connexion a {host}:{port}\n")
     print("1. Deux joueurs entrent dans le monde")

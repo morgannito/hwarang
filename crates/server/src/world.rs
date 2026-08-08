@@ -131,9 +131,26 @@ impl World {
 
     /// Fait apparaitre une entite et lui envoie le voisinage deja present.
     ///
+    /// `restored` porte l'etat rechargé depuis la persistance. `None` cree un
+    /// personnage neuf : c'est la premiere connexion d'un compte.
+    ///
     /// Retourne la position d'apparition.
-    pub fn enter(&self, id: EntityId, outbox: Outbox) -> Position {
-        let position = spawn_position(id);
+    pub fn enter(
+        &self,
+        id: EntityId,
+        outbox: Outbox,
+        restored: Option<(Character, Position)>,
+    ) -> Position {
+        let (character, position) = restored.unwrap_or_else(|| {
+            (
+                Character::create(
+                    CharacterId::new(id),
+                    starting_attributes(),
+                    ProgressionCurve::DEFAULT,
+                ),
+                spawn_position(id),
+            )
+        });
         let mut state = self.lock();
 
         state.entities.insert(
@@ -142,11 +159,7 @@ impl World {
                 position,
                 rule: MovementRule::running(),
                 combat: CombatRule::melee(),
-                character: Character::create(
-                    CharacterId::new(id),
-                    starting_attributes(),
-                    ProgressionCurve::DEFAULT,
-                ),
+                character,
                 outbox,
                 visible: HashSet::new(),
             },
@@ -425,6 +438,17 @@ impl World {
         self.lock().entities.len()
     }
 
+    /// Etat courant d'une entite, pour la sauvegarde.
+    ///
+    /// Lecture instantanee sous verrou : l'ecriture en base se fait ensuite,
+    /// hors verrou, pour ne pas retenir le monde pendant une entree-sortie.
+    #[must_use]
+    pub fn snapshot(&self, id: EntityId) -> Option<(Character, Position)> {
+        let state = self.lock();
+        let entity = state.entities.get(&id)?;
+        Some((entity.character, entity.position))
+    }
+
     /// Recalcule ce que `id` percoit, et symetriquement ce que les autres
     /// percoivent de lui.
     ///
@@ -589,7 +613,7 @@ mod tests {
 
     fn join(world: &World, id: EntityId) -> Receiver<ServerMessage> {
         let (tx, rx) = channel(OUTBOX_CAPACITY);
-        world.enter(id, tx);
+        world.enter(id, tx, None);
         rx
     }
 

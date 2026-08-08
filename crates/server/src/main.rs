@@ -1,52 +1,72 @@
 //! Adaptateur reseau : traduit un flux TCP en trames, delegue la decision a
-//! [`session::Session`] et l'etat partage a [`world::World`]. Aucune regle de
-//! jeu ici.
+//! [`session::Session`], l'etat partage a [`world::World`] et la durabilite a
+//! `hwarang_storage`. Aucune regle de jeu ici.
 
 mod session;
 mod world;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use hwarang_protocol::{ClientMessage, DecodeError, MAX_FRAME_LEN, ServerMessage};
+use hwarang_domain::ProgressionCurve;
+use hwarang_protocol::{AuthRefusal, ClientMessage, DecodeError, MAX_FRAME_LEN, ServerMessage};
+use hwarang_storage::{AccountId, SavedCharacter, Storage, StorageError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Sender, channel};
 
-use session::{Reaction, Session, WorldCommand};
+use session::{AuthCommand, Reaction, Session, WorldCommand};
 use world::World;
 
 const DEFAULT_BIND: &str = "127.0.0.1:13000";
+const DEFAULT_DATABASE: &str = "hwarang.sqlite";
 
 /// Compteur de sessions. Suffisant pour correler les journaux ; un identifiant
 /// non devinable sera necessaire le jour ou il servira a l'authentification.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Ce que partagent toutes les connexions.
+struct Shared {
+    world: World,
+    storage: Storage,
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let bind = std::env::var("HWARANG_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
+    let database =
+        PathBuf::from(std::env::var("HWARANG_DB").unwrap_or_else(|_| DEFAULT_DATABASE.to_owned()));
+
+    let storage = Storage::open(&database).map_err(|error| {
+        std::io::Error::other(format!(
+            "base {} inutilisable : {error}",
+            database.display()
+        ))
+    })?;
+    let shared = Arc::new(Shared {
+        world: World::new(),
+        storage,
+    });
+
     let listener = TcpListener::bind(&bind).await?;
-    let world = Arc::new(World::new());
-    println!("hwarang-server ecoute sur {bind}");
+    println!(
+        "hwarang-server ecoute sur {bind}, base {}",
+        database.display()
+    );
 
     loop {
         tokio::select! {
             incoming = listener.accept() => {
                 let (stream, peer) = incoming?;
                 let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-                let world = Arc::clone(&world);
+                let shared = Arc::clone(&shared);
                 tokio::spawn(async move {
                     let session = Session::new(id);
-                    let entity = session.entity_id();
-                    if let Err(error) = serve(stream, session, &world).await {
+                    if let Err(error) = serve(stream, session, &shared).await {
                         eprintln!("session {id} ({peer}) interrompue : {error}");
                     }
-                    // Quelle que soit la cause de la sortie — deconnexion propre,
-                    // violation de protocole, erreur reseau — l'entite doit
-                    // disparaitre pour les autres joueurs.
-                    world.leave(entity);
-                    println!("session {id} terminee, {} en jeu", world.population());
                 });
             }
             _ = tokio::signal::ctrl_c() => {
@@ -62,7 +82,33 @@ async fn main() -> std::io::Result<()> {
 ///
 /// Les deux sens vivent dans la meme tache via `select!` : une notification de
 /// deplacement d'un voisin doit partir sans attendre que ce client parle.
-async fn serve(stream: TcpStream, mut session: Session, world: &World) -> std::io::Result<()> {
+async fn serve(
+    stream: TcpStream,
+    mut session: Session,
+    shared: &Arc<Shared>,
+) -> std::io::Result<()> {
+    let entity = session.entity_id();
+    let outcome = run(stream, &mut session, shared).await;
+
+    // Quelle que soit la cause de la sortie — deconnexion propre, violation de
+    // protocole, erreur reseau — l'etat doit etre sauvegarde puis l'entite
+    // retiree. La sauvegarde vient d'abord : retirer l'entite effacerait
+    // justement ce qu'il faut ecrire.
+    persist(shared, &session, entity).await;
+    shared.world.leave(entity);
+    println!(
+        "session {entity} terminee, {} en jeu",
+        shared.world.population()
+    );
+
+    outcome
+}
+
+async fn run(
+    stream: TcpStream,
+    session: &mut Session,
+    shared: &Arc<Shared>,
+) -> std::io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (outbox, mut inbox) = channel::<ServerMessage>(world::OUTBOX_CAPACITY);
 
@@ -92,7 +138,7 @@ async fn serve(stream: TcpStream, mut session: Session, world: &World) -> std::i
                     return Ok(());
                 }
 
-                while let Some(reaction) = next_reaction(&mut buffer, &mut session) {
+                while let Some(reaction) = next_reaction(&mut buffer, session) {
                     match reaction {
                         Reaction::Reply(message) => {
                             writer.write_all(&message.encode()).await?;
@@ -103,12 +149,87 @@ async fn serve(stream: TcpStream, mut session: Session, world: &World) -> std::i
                         }
                         Reaction::Close => return Ok(()),
                         Reaction::Perform(command) => {
-                            perform(command, &session, world, &outbox, &mut clock);
+                            perform(command, session, shared, &outbox, &mut clock).await;
+                        }
+                        Reaction::Authenticate(command) => {
+                            let verdict = authenticate(shared, session, command).await;
+                            match verdict {
+                                Reaction::Reply(message) => {
+                                    writer.write_all(&message.encode()).await?;
+                                }
+                                // `authenticate` ne produit que des reponses.
+                                other => {
+                                    debug_assert!(false, "verdict inattendu : {other:?}");
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// Verifie des identifiants et met la session a jour.
+///
+/// Le hachage Argon2 est deliberement couteux en temps processeur. L'executer
+/// sur le fil asynchrone bloquerait toutes les autres connexions servies par le
+/// meme fil pendant la verification : `spawn_blocking` le confine a un fil dedie.
+async fn authenticate(
+    shared: &Arc<Shared>,
+    session: &mut Session,
+    command: AuthCommand,
+) -> Reaction {
+    let shared = Arc::clone(shared);
+    let outcome = tokio::task::spawn_blocking(move || match command {
+        AuthCommand::Register { username, password } => {
+            shared.storage.register(&username, &password)
+        }
+        AuthCommand::Login { username, password } => {
+            shared.storage.authenticate(&username, &password)
+        }
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(account)) => session.authenticated_as(account.as_u64()),
+        Ok(Err(error)) => Session::authentication_refused(refusal_of(&error)),
+        Err(error) => {
+            eprintln!("verification interrompue : {error}");
+            Session::authentication_refused(AuthRefusal::Unavailable)
+        }
+    }
+}
+
+const fn refusal_of(error: &StorageError) -> AuthRefusal {
+    match error {
+        StorageError::UsernameTaken => AuthRefusal::UsernameTaken,
+        StorageError::InvalidCredentials => AuthRefusal::InvalidCredentials,
+        StorageError::Credentials(_) => AuthRefusal::MalformedCredentials,
+        // Une panne de stockage ne doit rien reveler de plus qu'elle-meme.
+        StorageError::Database(_) | StorageError::Hashing(_) | StorageError::CorruptCharacter => {
+            AuthRefusal::Unavailable
+        }
+    }
+}
+
+/// Ecrit l'etat du personnage, si la session en avait un en jeu.
+async fn persist(shared: &Arc<Shared>, session: &Session, entity: u64) {
+    let (Some(account), Some((character, position))) =
+        (session.account_id(), shared.world.snapshot(entity))
+    else {
+        return;
+    };
+
+    let shared = Arc::clone(shared);
+    let saved = SavedCharacter::of(&character, position);
+    let account = AccountId::from_u64(account);
+
+    // L'ecriture disque est bloquante, comme le hachage.
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || shared.storage.save_character(account, &saved)).await
+    {
+        eprintln!("sauvegarde interrompue pour l'entite {entity} : {error}");
     }
 }
 
@@ -143,36 +264,81 @@ impl ActionClock {
     }
 }
 
-fn perform(
+async fn perform(
     command: WorldCommand,
     session: &Session,
-    world: &World,
+    shared: &Arc<Shared>,
     outbox: &Sender<ServerMessage>,
     clock: &mut ActionClock,
 ) {
     let id = session.entity_id();
     match command {
         WorldCommand::Enter => {
-            let at = world.enter(id, outbox.clone());
+            let restored = load_character(shared, session, id).await;
+            let known = restored.is_some();
+            let at = shared.world.enter(id, outbox.clone(), restored);
             *clock = ActionClock::new();
             println!(
-                "entite {id} apparait en ({}, {}), {} en jeu",
+                "entite {id} {} en ({}, {}), {} en jeu",
+                if known { "revient" } else { "apparait" },
                 at.x,
                 at.y,
-                world.population()
+                shared.world.population()
             );
         }
         WorldCommand::Move { x, y } => {
             let elapsed = ActionClock::take(&mut clock.last_move);
-            world.request_move(id, x, y, elapsed);
+            shared.world.request_move(id, x, y, elapsed);
         }
         WorldCommand::Attack { target } => {
             let elapsed = ActionClock::take(&mut clock.last_attack);
-            world.request_attack(id, target, elapsed);
+            shared.world.request_attack(id, target, elapsed);
         }
         WorldCommand::Respawn => {
-            world.request_respawn(id);
+            shared.world.request_respawn(id);
             *clock = ActionClock::new();
+        }
+    }
+}
+
+/// Recharge le personnage du compte authentifie, s'il en a deja un.
+///
+/// Une sauvegarde illisible n'empeche pas de jouer : le personnage repart neuf.
+/// Refuser la connexion punirait le joueur d'un defaut qui n'est pas le sien, et
+/// un compte devenu injouable ne se repare pas tout seul.
+async fn load_character(
+    shared: &Arc<Shared>,
+    session: &Session,
+    entity: u64,
+) -> Option<(hwarang_domain::Character, hwarang_domain::Position)> {
+    let account = AccountId::from_u64(session.account_id()?);
+    let shared_for_task = Arc::clone(shared);
+
+    let loaded =
+        tokio::task::spawn_blocking(move || shared_for_task.storage.load_character(account))
+            .await
+            .ok()?;
+
+    match loaded {
+        Ok(Some(saved)) => {
+            let position = saved.position;
+            match saved.into_character(
+                hwarang_domain::CharacterId::new(entity),
+                ProgressionCurve::DEFAULT,
+            ) {
+                Ok(character) => Some((character, position)),
+                Err(error) => {
+                    eprintln!(
+                        "sauvegarde illisible pour l'entite {entity}, reprise a neuf : {error}"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("lecture impossible pour l'entite {entity}, reprise a neuf : {error}");
+            None
         }
     }
 }

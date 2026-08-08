@@ -14,7 +14,17 @@ use codec::{Reader, Writer};
 /// Version du protocole. Toute rupture de format incremente cette valeur, ce
 /// qui permet au serveur de refuser proprement un client desynchronise plutot
 /// que de mal interpreter ses octets.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
+
+/// Longueur maximale d'un nom de compte, en octets UTF-8.
+pub const MAX_USERNAME_LEN: usize = 32;
+
+/// Longueur maximale d'un mot de passe, en octets UTF-8.
+///
+/// Bornee bien en deca de la trame : le cout de verification d'un mot de passe
+/// est deliberement eleve (Argon2), donc sa taille ne doit pas etre un levier
+/// supplementaire entre les mains d'un attaquant.
+pub const MAX_PASSWORD_LEN: usize = 128;
 
 /// Plafond d'une trame. Borne l'allocation faite sur donnee non fiable : sans
 /// lui, un client hostile annonce 65535 octets et fait allouer le serveur.
@@ -26,12 +36,16 @@ const HEADER_LEN: usize = 2;
 /// Identifiant d'une entite dans le monde, unique le temps d'une session serveur.
 pub type EntityId = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientMessage {
     /// Premiere trame envoyee par le client.
     Handshake { protocol_version: u16 },
     /// Maintien de session.
     Ping { nonce: u32 },
+    /// Creation de compte.
+    Register { username: String, password: String },
+    /// Authentification sur un compte existant.
+    Login { username: String, password: String },
     /// Demande d'apparition dans le monde.
     EnterWorld,
     /// Position revendiquee par le client.
@@ -84,10 +98,60 @@ impl AttackRefusal {
     }
 }
 
+/// Motif de refus d'une authentification.
+///
+/// **Volontairement grossier.** `InvalidCredentials` ne distingue pas « compte
+/// inconnu » de « mot de passe faux » : cette distinction permettrait d'enumerer
+/// les comptes existants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRefusal {
+    /// Identifiants incorrects, ou compte inexistant.
+    InvalidCredentials,
+    /// Nom deja pris, a l'inscription.
+    UsernameTaken,
+    /// Nom ou mot de passe hors des bornes acceptees.
+    MalformedCredentials,
+    /// Deja authentifie sur cette connexion.
+    AlreadyAuthenticated,
+    /// Panne de stockage.
+    Unavailable,
+}
+
+impl AuthRefusal {
+    const fn code(self) -> u8 {
+        match self {
+            Self::InvalidCredentials => 1,
+            Self::UsernameTaken => 2,
+            Self::MalformedCredentials => 3,
+            Self::AlreadyAuthenticated => 4,
+            Self::Unavailable => 5,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::InvalidCredentials),
+            2 => Some(Self::UsernameTaken),
+            3 => Some(Self::MalformedCredentials),
+            4 => Some(Self::AlreadyAuthenticated),
+            5 => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerMessage {
     HandshakeAccepted {
         session_id: u64,
+    },
+    /// Authentification reussie ; le personnage est pret a entrer dans le monde.
+    Authenticated {
+        account_id: u64,
+    },
+    /// Authentification refusee.
+    AuthRefused {
+        reason: AuthRefusal,
     },
     HandshakeRejected {
         expected_version: u16,
@@ -185,6 +249,8 @@ mod opcode {
     pub const MOVE: u8 = 0x04;
     pub const ATTACK: u8 = 0x05;
     pub const RESPAWN: u8 = 0x06;
+    pub const REGISTER: u8 = 0x07;
+    pub const LOGIN: u8 = 0x08;
 
     pub const HANDSHAKE_ACCEPTED: u8 = 0x81;
     pub const HANDSHAKE_REJECTED: u8 = 0x82;
@@ -199,6 +265,8 @@ mod opcode {
     pub const ENTITY_RESPAWNED: u8 = 0x8B;
     pub const ATTACK_REFUSED: u8 = 0x8C;
     pub const EXPERIENCE_GAINED: u8 = 0x8D;
+    pub const AUTHENTICATED: u8 = 0x8E;
+    pub const AUTH_REFUSED: u8 = 0x8F;
 }
 
 /// Isole une trame du flux : retourne `(opcode, charge utile, octets consommes)`.
@@ -262,21 +330,47 @@ fn read_point(payload: &[u8]) -> Result<(i32, i32), DecodeError> {
     Ok((x, y))
 }
 
+/// Charge utile commune aux trames portant des identifiants.
+fn credentials(opcode: u8, username: &str, password: &str) -> Vec<u8> {
+    frame(
+        opcode,
+        &Writer::default()
+            .string(username)
+            .string(password)
+            .into_bytes(),
+    )
+}
+
+fn read_credentials(payload: &[u8]) -> Result<(String, String), DecodeError> {
+    let mut reader = Reader::new(payload);
+    let username = reader.string(MAX_USERNAME_LEN)?;
+    let password = reader.string(MAX_PASSWORD_LEN)?;
+    reader.finish()?;
+    Ok((username, password))
+}
+
 impl ClientMessage {
     #[must_use]
-    pub fn encode(self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::Handshake { protocol_version } => frame(
                 opcode::HANDSHAKE,
-                &Writer::default().u16(protocol_version).into_bytes(),
+                &Writer::default().u16(*protocol_version).into_bytes(),
             ),
-            Self::Ping { nonce } => frame(opcode::PING, &Writer::default().u32(nonce).into_bytes()),
-            Self::EnterWorld => frame(opcode::ENTER_WORLD, &[]),
-            Self::Move { x, y } => {
-                frame(opcode::MOVE, &Writer::default().i32(x).i32(y).into_bytes())
+            Self::Ping { nonce } => {
+                frame(opcode::PING, &Writer::default().u32(*nonce).into_bytes())
             }
+            Self::Register { username, password } => {
+                credentials(opcode::REGISTER, username, password)
+            }
+            Self::Login { username, password } => credentials(opcode::LOGIN, username, password),
+            Self::EnterWorld => frame(opcode::ENTER_WORLD, &[]),
+            Self::Move { x, y } => frame(
+                opcode::MOVE,
+                &Writer::default().i32(*x).i32(*y).into_bytes(),
+            ),
             Self::Attack { target } => {
-                frame(opcode::ATTACK, &Writer::default().u64(target).into_bytes())
+                frame(opcode::ATTACK, &Writer::default().u64(*target).into_bytes())
             }
             Self::Respawn => frame(opcode::RESPAWN, &[]),
         }
@@ -301,6 +395,14 @@ impl ClientMessage {
                 let nonce = reader.u32()?;
                 reader.finish()?;
                 Self::Ping { nonce }
+            }
+            opcode::REGISTER => {
+                let (username, password) = read_credentials(payload)?;
+                Self::Register { username, password }
+            }
+            opcode::LOGIN => {
+                let (username, password) = read_credentials(payload)?;
+                Self::Login { username, password }
             }
             opcode::ENTER_WORLD => {
                 Reader::new(payload).finish()?;
@@ -396,11 +498,25 @@ impl ServerMessage {
                 opcode::EXPERIENCE_GAINED,
                 &Writer::default().u64(amount).u8(level).into_bytes(),
             ),
+            Self::Authenticated { account_id } => frame(
+                opcode::AUTHENTICATED,
+                &Writer::default().u64(account_id).into_bytes(),
+            ),
+            Self::AuthRefused { reason } => frame(
+                opcode::AUTH_REFUSED,
+                &Writer::default().u8(reason.code()).into_bytes(),
+            ),
         }
     }
 
     /// # Errors
     /// Voir [`DecodeError`].
+    ///
+    // Un `match` exhaustif sur toutes les variantes est long par nature. Le
+    // decouper en sous-fonctions par famille de message eloignerait chaque bras
+    // de son opcode, ce qui est precisement ce qu'on veut pouvoir relire d'un
+    // seul regard quand on debogue une trame sur le fil.
+    #[allow(clippy::too_many_lines)]
     pub fn decode(input: &[u8]) -> Result<(Self, usize), DecodeError> {
         let (opcode, payload, consumed) = split_frame(input)?;
         let message = match opcode {
@@ -494,6 +610,20 @@ impl ServerMessage {
                 reader.finish()?;
                 Self::ExperienceGained { amount, level }
             }
+            opcode::AUTHENTICATED => {
+                let mut reader = Reader::new(payload);
+                let account_id = reader.u64()?;
+                reader.finish()?;
+                Self::Authenticated { account_id }
+            }
+            opcode::AUTH_REFUSED => {
+                let mut reader = Reader::new(payload);
+                let code = reader.u8()?;
+                reader.finish()?;
+                Self::AuthRefused {
+                    reason: AuthRefusal::from_code(code).ok_or(DecodeError::MalformedPayload)?,
+                }
+            }
             other => return Err(DecodeError::UnknownOpcode(other)),
         };
         Ok((message, consumed))
@@ -520,6 +650,14 @@ mod tests {
             },
             ClientMessage::Attack { target: u64::MAX },
             ClientMessage::Respawn,
+            ClientMessage::Register {
+                username: "morgann".to_owned(),
+                password: "élève-guerrier 한량 🐺".to_owned(),
+            },
+            ClientMessage::Login {
+                username: String::new(),
+                password: String::new(),
+            },
         ]
     }
 
@@ -570,7 +708,45 @@ mod tests {
                 amount: u64::MAX,
                 level: 120,
             },
+            ServerMessage::Authenticated { account_id: 77 },
+            ServerMessage::AuthRefused {
+                reason: AuthRefusal::InvalidCredentials,
+            },
         ]
+    }
+
+    #[test]
+    fn tous_les_motifs_de_refus_d_authentification_font_un_aller_retour() {
+        for reason in [
+            AuthRefusal::InvalidCredentials,
+            AuthRefusal::UsernameTaken,
+            AuthRefusal::MalformedCredentials,
+            AuthRefusal::AlreadyAuthenticated,
+            AuthRefusal::Unavailable,
+        ] {
+            let bytes = ServerMessage::AuthRefused { reason }.encode();
+            assert_eq!(
+                ServerMessage::decode(&bytes).unwrap().0,
+                ServerMessage::AuthRefused { reason }
+            );
+        }
+    }
+
+    #[test]
+    fn des_identifiants_trop_longs_sont_rejetes() {
+        // Un client hostile annonce un nom de 60 000 octets : le decodeur doit
+        // refuser sur la borne, sans tenter de le materialiser.
+        let long_name = "a".repeat(MAX_USERNAME_LEN + 1);
+        let bytes = ClientMessage::Register {
+            username: long_name,
+            password: "x".to_owned(),
+        }
+        .encode();
+
+        assert_eq!(
+            ClientMessage::decode(&bytes),
+            Err(DecodeError::MalformedPayload)
+        );
     }
 
     #[test]

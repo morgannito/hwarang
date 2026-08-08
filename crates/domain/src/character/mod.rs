@@ -85,9 +85,46 @@ impl Character {
         }
     }
 
+    /// Reconstitue un personnage depuis un etat sauvegarde.
+    ///
+    /// Les invariants sont revalides plutot que supposes : une sauvegarde peut
+    /// avoir ete ecrite par une version anterieure, modifiee a la main, ou
+    /// corrompue. `None` si l'etat ne peut pas exister — mieux vaut refuser un
+    /// personnage que le charger dans une configuration que le jeu tient pour
+    /// impossible.
+    #[must_use]
+    pub fn restore(
+        id: CharacterId,
+        level: Level,
+        experience: Experience,
+        attributes: Attributes,
+        current_health: u32,
+        curve: ProgressionCurve,
+    ) -> Option<Self> {
+        let max_health = attributes.max_health(level);
+        let vitals = Vitals::full(max_health)?;
+        // Un personnage sauvegarde mort revient a terre : c'est un etat legitime
+        // du jeu, distinct d'une sauvegarde invalide.
+        let vitals = vitals.damaged_by(max_health.saturating_sub(current_health.min(max_health)));
+
+        Some(Self {
+            id,
+            level,
+            experience,
+            attributes,
+            vitals,
+            curve,
+        })
+    }
+
     #[must_use]
     pub const fn id(self) -> CharacterId {
         self.id
+    }
+
+    #[must_use]
+    pub const fn curve(self) -> ProgressionCurve {
+        self.curve
     }
 
     #[must_use]
@@ -202,7 +239,7 @@ impl Character {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -317,6 +354,58 @@ mod tests {
         assert_eq!(revived.vitals().current(), revived.vitals().max());
         assert_eq!(revived.level(), grown.level());
         assert_eq!(revived.experience(), grown.experience());
+    }
+
+    #[test]
+    fn un_personnage_sauvegarde_revient_a_l_identique() {
+        let (grown, _) = hero().gain_experience(Experience::new(500_000));
+        let wounded = grown.take_damage(120);
+
+        let restored = Character::restore(
+            wounded.id(),
+            wounded.level(),
+            wounded.experience(),
+            wounded.attributes(),
+            wounded.vitals().current(),
+            wounded.curve(),
+        )
+        .expect("l'etat provient d'un personnage valide");
+
+        assert_eq!(restored, wounded);
+    }
+
+    #[test]
+    fn un_personnage_sauvegarde_mort_revient_a_terre() {
+        let dead = hero().take_damage(u32::MAX);
+        let restored = Character::restore(
+            dead.id(),
+            dead.level(),
+            dead.experience(),
+            dead.attributes(),
+            0,
+            dead.curve(),
+        )
+        .expect("mourir est un etat legitime");
+
+        assert!(!restored.is_alive());
+    }
+
+    #[test]
+    fn une_sauvegarde_incoherente_ne_depasse_pas_le_maximum() {
+        // Sauvegarde trafiquee : plus de points de vie que le maximum autorise
+        // par les attributs. La restauration ecrete au lieu de faire confiance.
+        let reference = hero();
+        let restored = Character::restore(
+            reference.id(),
+            reference.level(),
+            Experience::ZERO,
+            reference.attributes(),
+            u32::MAX,
+            ProgressionCurve::DEFAULT,
+        )
+        .expect("l'ecretage rend l'etat valide");
+
+        assert_eq!(restored.vitals().current(), restored.vitals().max());
     }
 
     #[test]

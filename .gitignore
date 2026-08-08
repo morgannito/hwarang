@@ -10,3 +10,8 @@ export_presets.cfg
 # Secrets d'environnement : jamais versionnes
 .env
 *.local.toml
+
+# Base locale du serveur
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

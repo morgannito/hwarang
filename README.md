@@ -55,23 +55,25 @@ jeu est testable sans lancer un serveur ni une base de données.
 crates/
 ├── domain/     Règles de jeu. Zéro dépendance, zéro I/O.
 │   ├── character/  progression, attributs
-│   ├── combat/     résolution d'attaque
+│   ├── combat/     dégâts, engagement (portée, cadence)
 │   └── world/      positions, mouvement, grille d'intérêt
 ├── protocol/   Trames binaires client/serveur. Encodage explicite.
+├── storage/    Comptes et sauvegardes. SQLite + Argon2.
 └── server/     Adaptateur TCP + registre d'entités. Aucune règle de jeu.
 ```
 
-La dépendance ne va que dans un sens : `server → protocol → domain`.
+La dépendance ne va que dans un sens : `server → {protocol, storage} → domain`.
 
 ## Démarrer
 
 ```bash
-cargo test --workspace          # 112 tests
-cargo run -p hwarang-server     # écoute sur 127.0.0.1:13000
-HWARANG_BIND=0.0.0.0:13000 cargo run -p hwarang-server
+cargo test --workspace          # 157 tests
+cargo run -p hwarang-server     # 127.0.0.1:13000, base ./hwarang.sqlite
+HWARANG_BIND=0.0.0.0:13000 HWARANG_DB=/var/lib/hwarang.sqlite \
+  cargo run -p hwarang-server
 ```
 
-Trois vérifications bout en bout, contre un serveur en cours d'exécution. Elles
+Quatre vérifications bout en bout, contre un serveur en cours d'exécution. Elles
 réimplémentent le format binaire au lieu de réutiliser `hwarang-protocol` : un
 test qui partagerait l'encodage du serveur ne prouverait rien sur ce qui circule
 réellement.
@@ -80,11 +82,13 @@ réellement.
 python3 scripts/smoke.py 127.0.0.1 13000         # protocole, cas hostiles
 python3 scripts/two_clients.py 127.0.0.1 13000   # diffusion entre deux joueurs
 python3 scripts/combat.py 127.0.0.1 13000        # portée, cadence, mort, XP
+python3 scripts/persistence.py 127.0.0.1 13000 phase1   # puis redémarrer,
+python3 scripts/persistence.py 127.0.0.1 13000 phase2   # même HWARANG_DB
 ```
 
-Chacune attend un monde vierge : les lancer à la suite sur un même serveur les
-rend dépendantes de l'état laissé par la précédente. La CI démarre un serveur
-neuf par démonstration.
+Chacune attend un monde et une base vierges. La CI démarre un serveur neuf par
+démonstration : un scénario qui dépend de ce qu'a laissé le précédent ne dit
+rien de clair quand il échoue.
 
 ## État
 
@@ -94,15 +98,18 @@ neuf par démonstration.
 | Domaine : positions, mouvement, grille d'intérêt | testé |
 | Protocole binaire + machine à états de session | testé |
 | Serveur : registre d'entités, diffusion, combat | fonctionnel |
-| Persistance | à faire |
+| Comptes (Argon2) et sauvegarde des personnages | fonctionnel |
+| Monde peuplé (créatures, IA) | à faire |
 | Client (Godot 4) | à faire |
 
-Ce qui marche aujourd'hui : deux clients se connectent, se découvrent, se voient
-bouger en temps réel, disparaissent l'un de l'autre hors du champ de vision,
-s'affrontent au corps à corps jusqu'à la mort de l'un, qui gagne de
-l'expérience et peut réapparaître. Déplacement trop rapide, attaque hors de
-portée, rafale d'attaques et acharnement sur un cadavre sont refusés par le
-serveur, avec le motif.
+Ce qui marche aujourd'hui : on crée un compte, on entre dans le monde, on voit
+les autres joueurs bouger en temps réel, on les perd de vue en s'éloignant, on
+s'affronte au corps à corps jusqu'à la mort de l'un — qui gagne de l'expérience
+et peut réapparaître. **On se déconnecte, le serveur redémarre, et on retrouve
+son personnage où on l'avait laissé.**
+
+Déplacement trop rapide, attaque hors de portée, rafale d'attaques, acharnement
+sur un cadavre : refusés par le serveur, avec le motif.
 
 ## Suite
 

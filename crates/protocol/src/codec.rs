@@ -45,6 +45,24 @@ impl<'a> Reader<'a> {
         self.take::<4>().map(i32::from_be_bytes)
     }
 
+    /// Chaine precedee de sa longueur en octets (`u16`).
+    ///
+    /// L'UTF-8 est valide ici et non plus haut : une chaine mal formee est une
+    /// charge utile incoherente, au meme titre qu'un entier tronque. La laisser
+    /// passer imposerait a chaque appelant de s'en mefier.
+    pub(crate) fn string(&mut self, max_len: usize) -> Result<String, DecodeError> {
+        let len = usize::from(self.u16()?);
+        if len > max_len {
+            return Err(DecodeError::MalformedPayload);
+        }
+        let (head, tail) = self
+            .bytes
+            .split_at_checked(len)
+            .ok_or(DecodeError::MalformedPayload)?;
+        self.bytes = tail;
+        String::from_utf8(head.to_vec()).map_err(|_| DecodeError::MalformedPayload)
+    }
+
     /// Echoue s'il reste des octets non lus.
     pub(crate) const fn finish(self) -> Result<(), DecodeError> {
         if self.bytes.is_empty() {
@@ -87,6 +105,19 @@ impl Writer {
         self
     }
 
+    /// Chaine precedee de sa longueur en octets (`u16`).
+    ///
+    /// La longueur est celle des **octets** UTF-8, pas des caracteres : c'est ce
+    /// que le lecteur doit consommer sur le fil.
+    pub(crate) fn string(mut self, value: &str) -> Self {
+        let bytes = value.as_bytes();
+        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+        self.bytes.extend_from_slice(&len.to_be_bytes());
+        self.bytes
+            .extend_from_slice(&bytes[..usize::from(len).min(bytes.len())]);
+        self
+    }
+
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
@@ -126,6 +157,53 @@ mod tests {
         let mut reader = Reader::new(&bytes);
         assert_eq!(reader.u32(), Ok(1));
         assert_eq!(reader.finish(), Err(DecodeError::MalformedPayload));
+    }
+
+    #[test]
+    fn les_chaines_survivent_a_l_aller_retour() {
+        for value in ["", "morgann", "élève-guerrier 한량", "🐺"] {
+            let bytes = Writer::default().string(value).into_bytes();
+            assert_eq!(Reader::new(&bytes).string(64), Ok(value.to_owned()));
+        }
+    }
+
+    #[test]
+    fn une_chaine_trop_longue_est_rejetee_avant_lecture() {
+        let bytes = Writer::default().string("douze octets").into_bytes();
+        assert_eq!(
+            Reader::new(&bytes).string(4),
+            Err(DecodeError::MalformedPayload)
+        );
+    }
+
+    #[test]
+    fn une_chaine_annoncant_plus_qu_elle_ne_porte_est_rejetee() {
+        // Longueur annoncee 10, deux octets fournis.
+        let bytes = vec![0, 10, b'a', b'b'];
+        assert_eq!(
+            Reader::new(&bytes).string(64),
+            Err(DecodeError::MalformedPayload)
+        );
+    }
+
+    #[test]
+    fn une_chaine_non_utf8_est_rejetee() {
+        let bytes = vec![0, 2, 0xFF, 0xFE];
+        assert_eq!(
+            Reader::new(&bytes).string(64),
+            Err(DecodeError::MalformedPayload)
+        );
+    }
+
+    #[test]
+    fn une_chaine_suit_d_autres_champs_sans_les_perturber() {
+        let bytes = Writer::default().u32(7).string("alice").u16(9).into_bytes();
+
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.u32(), Ok(7));
+        assert_eq!(reader.string(64), Ok("alice".to_owned()));
+        assert_eq!(reader.u16(), Ok(9));
+        assert_eq!(reader.finish(), Ok(()));
     }
 
     #[test]
