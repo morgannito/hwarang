@@ -1,0 +1,14 @@
+[package]
+name = "hwarang-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Coeur metier pur : aucune I/O, aucune dependance infrastructure."
+
+# Le domaine reste sans dependance. Toute crate ajoutee ici doit etre justifiee
+# par un ADR : c'est la garantie que la logique de jeu reste testable a froid.
+[dependencies]
+
+[lints]
+workspace = true

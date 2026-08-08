@@ -1,0 +1,12 @@
+[package]
+name = "hwarang-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Encodage binaire des trames client/serveur. Sans I/O."
+
+[dependencies]
+
+[lints]
+workspace = true

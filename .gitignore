@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+.DS_Store
+
+# Client Godot (a venir)
+.godot/
+/client/android/
+export_presets.cfg
+
+# Secrets d'environnement : jamais versionnes
+.env
+*.local.toml

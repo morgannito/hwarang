@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/domain", "crates/protocol", "crates/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/morgannito/hwarang"
+
+[workspace.dependencies]
+hwarang-domain = { path = "crates/domain" }
+hwarang-protocol = { path = "crates/protocol" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"

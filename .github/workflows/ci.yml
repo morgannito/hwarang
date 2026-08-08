@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  smoke:
+    name: protocole bout en bout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p hwarang-server
+
+      # Lancement et verification dans le meme step : un process detache ne
+      # survit pas de facon fiable d'un step a l'autre.
+      # Le smoke test rejoue le format binaire sans passer par hwarang-protocol,
+      # donc il verifie ce qui sort reellement sur le fil, pas la coherence interne.
+      - name: Smoke
+        run: |
+          set -euo pipefail
+          HWARANG_BIND=127.0.0.1:13000 ./target/release/hwarang-server &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+
+          python3 - <<'WAIT'
+          import socket, sys, time
+          deadline = time.monotonic() + 15
+          while time.monotonic() < deadline:
+              try:
+                  socket.create_connection(("127.0.0.1", 13000), timeout=1).close()
+                  sys.exit(0)
+              except OSError:
+                  time.sleep(0.2)
+          sys.exit("le serveur n'a pas ouvert le port")
+          WAIT
+
+          python3 scripts/smoke.py 127.0.0.1 13000
