@@ -36,6 +36,12 @@ serveur. `ProgressionCurve` est une donnée du domaine.
 **Franchissement de paliers multiples en une passe.** Un gain massif d'expérience
 n'est ni tronqué à un palier, ni renvoyé à l'appelant pour rejouer la règle.
 
+**Serveur autoritaire sur les déplacements.** Metin2 laisse le client annoncer
+sa position et le croit sur parole — c'est l'origine du speedhack endémique de
+l'écosystème. Ici le client *propose*, le serveur vérifie que la distance est
+compatible avec le temps écoulé (mesuré côté serveur), et en cas de refus
+renvoie sa propre position pour resynchroniser sans aller-retour.
+
 **Domaine sans I/O.** `hwarang-domain` n'a aucune dépendance : chaque règle de
 jeu est testable sans lancer un serveur ni une base de données.
 
@@ -44,8 +50,11 @@ jeu est testable sans lancer un serveur ni une base de données.
 ```
 crates/
 ├── domain/     Règles de jeu. Zéro dépendance, zéro I/O.
+│   ├── character/  progression, attributs
+│   ├── combat/     résolution d'attaque
+│   └── world/      positions, mouvement, grille d'intérêt
 ├── protocol/   Trames binaires client/serveur. Encodage explicite.
-└── server/     Adaptateur TCP. Aucune règle de jeu.
+└── server/     Adaptateur TCP + registre d'entités. Aucune règle de jeu.
 ```
 
 La dépendance ne va que dans un sens : `server → protocol → domain`.
@@ -53,27 +62,35 @@ La dépendance ne va que dans un sens : `server → protocol → domain`.
 ## Démarrer
 
 ```bash
-cargo test --workspace          # 43 tests, tous sur le domaine et le protocole
+cargo test --workspace          # 82 tests
 cargo run -p hwarang-server     # écoute sur 127.0.0.1:13000
 HWARANG_BIND=0.0.0.0:13000 cargo run -p hwarang-server
 ```
 
-Vérification bout en bout du protocole :
+Deux vérifications bout en bout, contre un serveur en cours d'exécution. Les
+deux réimplémentent le format binaire au lieu de réutiliser `hwarang-protocol` :
+un test qui partagerait l'encodage du serveur ne prouverait rien sur ce qui
+circule réellement.
 
 ```bash
-python3 scripts/smoke.py 127.0.0.1 13000
+python3 scripts/smoke.py 127.0.0.1 13000         # protocole, cas hostiles
+python3 scripts/two_clients.py 127.0.0.1 13000   # diffusion entre deux joueurs
 ```
 
 ## État
 
 | Composant | État |
 |---|---|
-| Domaine : progression, jauges, combat | socle posé, testé |
-| Protocole binaire + machine à états de session | socle posé, testé |
-| Serveur TCP | handshake + ping, arrêt propre |
+| Domaine : progression, jauges, combat | testé |
+| Domaine : positions, mouvement, grille d'intérêt | testé |
+| Protocole binaire + machine à états de session | testé |
+| Serveur TCP, registre d'entités, diffusion aux voisins | fonctionnel |
 | Persistance | à faire |
-| Monde, déplacement, zones d'intérêt | à faire |
 | Client (Godot 4) | à faire |
+
+Ce qui marche aujourd'hui : deux clients se connectent, se découvrent, se voient
+bouger en temps réel, disparaissent l'un de l'autre en sortant du champ de
+vision, et un déplacement impossible est refusé puis corrigé par le serveur.
 
 ## Décisions d'architecture
 

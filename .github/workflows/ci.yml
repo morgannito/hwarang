@@ -66,3 +66,4 @@ jobs:
           WAIT
 
           python3 scripts/smoke.py 127.0.0.1 13000
+          python3 scripts/two_clients.py 127.0.0.1 13000

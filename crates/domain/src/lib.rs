@@ -7,7 +7,9 @@
 pub mod character;
 pub mod combat;
 pub mod shared;
+pub mod world;
 
 pub use character::{Attributes, Character, CharacterId, ProgressionOutcome};
 pub use combat::{AttackProfile, DefenseProfile, Resistance, resolve_attack};
 pub use shared::{Experience, Level, ProgressionCurve, Vitals};
+pub use world::{CellCoord, Grid, MoveVerdict, MovementRule, MovementSpeed, Position};
