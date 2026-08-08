@@ -87,6 +87,7 @@ jobs:
           run_demo smoke.py 13001
           run_demo two_clients.py 13002
           run_demo combat.py 13003
+          run_demo creatures.py 13005
 
           # La persistance demande deux serveurs successifs sur la MEME base :
           # c'est tout l'objet du test, il ne peut pas passer par `run_demo`.

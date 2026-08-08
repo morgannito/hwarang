@@ -10,14 +10,7 @@ description = "Adaptateur reseau : expose le domaine via TCP."
 hwarang-domain.workspace = true
 hwarang-protocol.workspace = true
 hwarang-storage = { version = "0.1.0", path = "../storage" }
-tokio = { version = "1", features = [
-    "rt-multi-thread",
-    "macros",
-    "net",
-    "io-util",
-    "signal",
-    "sync",
-] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 
 [lints]
 workspace = true

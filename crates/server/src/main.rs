@@ -8,7 +8,7 @@ mod world;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hwarang_domain::ProgressionCurve;
 use hwarang_protocol::{AuthRefusal, ClientMessage, DecodeError, MAX_FRAME_LEN, ServerMessage};
@@ -50,6 +50,10 @@ async fn main() -> std::io::Result<()> {
         storage,
     });
 
+    shared.world.populate_starting_area(CREATURE_COUNT);
+    println!("{CREATURE_COUNT} creatures en place");
+    tokio::spawn(simulate(Arc::clone(&shared)));
+
     let listener = TcpListener::bind(&bind).await?;
     println!(
         "hwarang-server ecoute sur {bind}, base {}",
@@ -74,6 +78,32 @@ async fn main() -> std::io::Result<()> {
                 return Ok(());
             }
         }
+    }
+}
+
+/// Pas de simulation.
+///
+/// 200 ms : assez court pour qu'une poursuite paraisse continue une fois le
+/// mouvement interpole par le client, assez long pour ne pas inonder le reseau
+/// d'un `EntityMoved` par creature et par image.
+const TICK: Duration = Duration::from_millis(200);
+
+/// Nombre de creatures peuplant la zone de depart.
+const CREATURE_COUNT: u64 = 6;
+
+/// Boucle de simulation.
+///
+/// Le pas nominal est passe a `tick` plutot que le temps reellement ecoule : un
+/// serveur en retard ne doit pas faire bondir les creatures pour rattraper: elles
+/// avanceraient au-dela de leur vitesse, ce que la validation refuserait de toute
+/// facon, et le mouvement paraitrait saccade.
+async fn simulate(shared: Arc<Shared>) {
+    let mut ticker = tokio::time::interval(TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        shared.world.tick(TICK, Instant::now());
     }
 }
 

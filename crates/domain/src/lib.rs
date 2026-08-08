@@ -4,11 +4,13 @@
 //! donnees, ni le client. Elle expose des types immuables et des fonctions
 //! pures, ce qui rend chaque regle de jeu testable sans lancer de serveur.
 
+pub mod ai;
 pub mod character;
 pub mod combat;
 pub mod shared;
 pub mod world;
 
+pub use ai::{AggroRule, Intent, Situation, Stance, Threat};
 pub use character::{Attributes, Character, CharacterId, ProgressionOutcome};
 pub use combat::{
     AttackProfile, AttackRejection, CombatRule, DefenseProfile, Engagement, Resistance,

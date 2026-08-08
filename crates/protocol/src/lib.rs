@@ -14,7 +14,7 @@ use codec::{Reader, Writer};
 /// Version du protocole. Toute rupture de format incremente cette valeur, ce
 /// qui permet au serveur de refuser proprement un client desynchronise plutot
 /// que de mal interpreter ses octets.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Longueur maximale d'un nom de compte, en octets UTF-8.
 pub const MAX_USERNAME_LEN: usize = 32;
@@ -35,6 +35,33 @@ const HEADER_LEN: usize = 2;
 
 /// Identifiant d'une entite dans le monde, unique le temps d'une session serveur.
 pub type EntityId = u64;
+
+/// Nature d'une entite, pour que le client sache quoi afficher.
+///
+/// Transmise a l'apparition seulement : la nature d'une entite ne change pas au
+/// cours de sa vie, la repeter a chaque deplacement serait du trafic inutile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityKind {
+    Player,
+    Creature,
+}
+
+impl EntityKind {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Player => 1,
+            Self::Creature => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Player),
+            2 => Some(Self::Creature),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientMessage {
@@ -168,6 +195,7 @@ pub enum ServerMessage {
     /// Une entite entre dans le champ de vision.
     EntityAppeared {
         entity_id: EntityId,
+        kind: EntityKind,
         x: i32,
         y: i32,
     },
@@ -444,9 +472,20 @@ impl ServerMessage {
             Self::WorldEntered { entity_id, x, y } => {
                 entity_at(opcode::WORLD_ENTERED, entity_id, x, y)
             }
-            Self::EntityAppeared { entity_id, x, y } => {
-                entity_at(opcode::ENTITY_APPEARED, entity_id, x, y)
-            }
+            Self::EntityAppeared {
+                entity_id,
+                kind,
+                x,
+                y,
+            } => frame(
+                opcode::ENTITY_APPEARED,
+                &Writer::default()
+                    .u64(entity_id)
+                    .u8(kind.code())
+                    .i32(x)
+                    .i32(y)
+                    .into_bytes(),
+            ),
             Self::EntityMoved { entity_id, x, y } => {
                 entity_at(opcode::ENTITY_MOVED, entity_id, x, y)
             }
@@ -543,8 +582,18 @@ impl ServerMessage {
                 Self::WorldEntered { entity_id, x, y }
             }
             opcode::ENTITY_APPEARED => {
-                let (entity_id, x, y) = read_entity_at(payload)?;
-                Self::EntityAppeared { entity_id, x, y }
+                let mut reader = Reader::new(payload);
+                let entity_id = reader.u64()?;
+                let code = reader.u8()?;
+                let x = reader.i32()?;
+                let y = reader.i32()?;
+                reader.finish()?;
+                Self::EntityAppeared {
+                    entity_id,
+                    kind: EntityKind::from_code(code).ok_or(DecodeError::MalformedPayload)?,
+                    x,
+                    y,
+                }
             }
             opcode::ENTITY_MOVED => {
                 let (entity_id, x, y) = read_entity_at(payload)?;
@@ -675,6 +724,7 @@ mod tests {
             },
             ServerMessage::EntityAppeared {
                 entity_id: u64::MAX,
+                kind: EntityKind::Creature,
                 x: 0,
                 y: 0,
             },
@@ -713,6 +763,34 @@ mod tests {
                 reason: AuthRefusal::InvalidCredentials,
             },
         ]
+    }
+
+    #[test]
+    fn les_deux_natures_d_entite_font_un_aller_retour() {
+        for kind in [EntityKind::Player, EntityKind::Creature] {
+            let bytes = ServerMessage::EntityAppeared {
+                entity_id: 3,
+                kind,
+                x: 1,
+                y: 2,
+            }
+            .encode();
+            assert!(matches!(
+                ServerMessage::decode(&bytes).unwrap().0,
+                ServerMessage::EntityAppeared { kind: decoded, .. } if decoded == kind
+            ));
+        }
+    }
+
+    #[test]
+    fn une_nature_d_entite_inconnue_est_rejetee() {
+        // Un serveur plus recent qui ajouterait une nature ne doit pas etre
+        // interprete de travers par un client qui l'ignore.
+        let payload = Writer::default().u64(1).u8(0).i32(0).i32(0).into_bytes();
+        assert_eq!(
+            ServerMessage::decode(&frame(opcode::ENTITY_APPEARED, &payload)),
+            Err(DecodeError::MalformedPayload)
+        );
     }
 
     #[test]

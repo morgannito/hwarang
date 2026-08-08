@@ -6,13 +6,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use hwarang_domain::{
-    AttackProfile, AttackRejection, Attributes, CellCoord, Character, CharacterId, CombatRule,
-    DefenseProfile, Engagement, Grid, MoveVerdict, MovementRule, Position, ProgressionCurve,
-    Resistance, experience_reward, resolve_attack,
+    AggroRule, AttackProfile, AttackRejection, Attributes, CellCoord, Character, CharacterId,
+    CombatRule, DefenseProfile, Engagement, Grid, Intent, MoveVerdict, MovementRule, Position,
+    ProgressionCurve, Resistance, Situation, Stance, Threat, experience_reward, resolve_attack,
 };
-use hwarang_protocol::{AttackRefusal, EntityId, ServerMessage};
+use hwarang_protocol::{AttackRefusal, EntityId, EntityKind, ServerMessage};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -39,12 +40,33 @@ type Outbox = Sender<ServerMessage>;
 /// melee), etroite de quoi que le retard devienne visible avant de couter cher.
 pub const OUTBOX_CAPACITY: usize = 256;
 
+/// Ce qui pilote une creature : sa politique, son poste et sa posture.
+///
+/// Absent des entites joueuses : c'est ce qui distingue une entite mue par un
+/// client d'une entite mue par la simulation.
+#[derive(Debug, Clone, Copy)]
+struct Brain {
+    rule: AggroRule,
+    anchor: Position,
+    stance: Stance,
+    /// Instant de la mort, pour la reapparition differee.
+    died_at: Option<Instant>,
+    /// Instant de la derniere attaque **portee**, pas de la derniere tentative.
+    ///
+    /// La creature tente sa chance a chaque pas de simulation : compter les
+    /// tentatives remettrait son horloge a zero toutes les 200 ms, et sa cadence
+    /// d une seconde ne serait jamais atteinte.
+    last_attack: Option<Instant>,
+}
+
 struct Entity {
     position: Position,
     rule: MovementRule,
     combat: CombatRule,
     character: Character,
-    outbox: Outbox,
+    /// `None` pour un joueur : la connexion attend ses messages.
+    outbox: Option<Outbox>,
+    brain: Option<Brain>,
     /// Entites actuellement percues. Maintenu symetriquement.
     visible: HashSet<EntityId>,
 }
@@ -52,6 +74,14 @@ struct Entity {
 impl Entity {
     fn is_alive(&self) -> bool {
         self.character.is_alive()
+    }
+
+    const fn kind(&self) -> EntityKind {
+        if self.brain.is_some() {
+            EntityKind::Creature
+        } else {
+            EntityKind::Player
+        }
     }
 
     fn attack_profile(&self) -> AttackProfile {
@@ -67,6 +97,56 @@ impl Entity {
 
 /// Puissance de base, avant contribution des attributs.
 const BASE_ATTACK: u32 = 120;
+
+/// Delai avant qu'une creature abattue ne revienne a son poste.
+///
+/// Assez long pour que le joueur constate sa victoire et ramasse ce qu'elle
+/// laissera un jour ; assez court pour qu'une zone ne se vide pas.
+pub const CREATURE_RESPAWN_DELAY: Duration = Duration::from_secs(10);
+
+/// Premier poste de la zone de depart, a l'ecart du point d'apparition des
+/// joueurs : on doit aller chercher les creatures, pas naitre au milieu.
+const STARTING_AREA_ORIGIN: Position = Position::new(6_000, 1_500);
+
+/// Ecart entre deux postes de creatures.
+///
+/// Au moins deux fois le rayon d'agressivite, pour qu'aucune position ne
+/// permette d'en reveiller deux a la fois.
+const CREATURE_SPACING_CM: i32 = 3_200;
+
+/// Attributs d'une creature de base.
+///
+/// Plus faible qu'un joueur : le premier adversaire rencontre doit pouvoir etre
+/// battu par un personnage neuf, sinon la zone de depart est infranchissable.
+fn creature_attributes() -> Attributes {
+    Attributes {
+        strength: 6,
+        dexterity: 4,
+        vitality: 4,
+        intellect: 1,
+    }
+}
+
+/// Point situe a au plus `allowance_cm` de `from`, en direction de `target`.
+///
+/// Arithmetique entiere : la trajectoire d'une creature doit etre identique
+/// d'une machine a l'autre, comme tout le reste de la simulation.
+fn advance(from: Position, target: Position, allowance_cm: u64) -> Position {
+    let distance = from.distance_squared(target).isqrt();
+    if distance == 0 || distance <= allowance_cm {
+        return target;
+    }
+
+    let dx = i64::from(target.x) - i64::from(from.x);
+    let dy = i64::from(target.y) - i64::from(from.y);
+    let reach = i64::try_from(allowance_cm).unwrap_or(i64::MAX);
+    let span = i64::try_from(distance).unwrap_or(i64::MAX).max(1);
+
+    Position::new(
+        i32::try_from(i64::from(from.x) + dx * reach / span).unwrap_or(from.x),
+        i32::try_from(i64::from(from.y) + dy * reach / span).unwrap_or(from.y),
+    )
+}
 
 /// Attributs de depart d'un joueur.
 ///
@@ -88,6 +168,15 @@ const fn refusal_of(rejection: AttackRejection) -> AttackRefusal {
         AttackRejection::TargetDown => AttackRefusal::TargetDown,
         AttackRejection::SelfTarget => AttackRefusal::SelfTarget,
     }
+}
+
+/// Ce qu'une creature percoit a un instant donne.
+struct Observation {
+    situation: Situation,
+    /// Identifiant de la cible retenue, s'il y en a une.
+    target: Option<EntityId>,
+    alive: bool,
+    died_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -160,7 +249,8 @@ impl World {
                 rule: MovementRule::running(),
                 combat: CombatRule::melee(),
                 character,
-                outbox,
+                outbox: Some(outbox),
+                brain: None,
                 visible: HashSet::new(),
             },
         );
@@ -254,18 +344,24 @@ impl World {
 
     /// Resout une attaque revendiquee par un client.
     ///
-    /// `elapsed_ms` est mesure par le serveur depuis la derniere *tentative*,
-    /// retenue ou non, jamais annonce par le client.
+    /// Retourne `true` si le coup a porte.
+    ///
+    /// `elapsed_ms` est mesure par le serveur, jamais annonce par le client.
     ///
     /// Compter depuis la derniere attaque *aboutie* laisserait un client
     /// accumuler du temps a coups de tentatives refusees, puis le depenser en
     /// salve. Le prix a payer est qu'une tentative hors de portee decale la
     /// premiere frappe recevable d'un cycle de cadence.
-    pub fn request_attack(&self, attacker_id: EntityId, target_id: EntityId, elapsed_ms: u64) {
+    pub fn request_attack(
+        &self,
+        attacker_id: EntityId,
+        target_id: EntityId,
+        elapsed_ms: u64,
+    ) -> bool {
         let mut state = self.lock();
 
         let Some(attacker) = state.entities.get(&attacker_id) else {
-            return;
+            return false;
         };
         let Some(target) = state.entities.get(&target_id) else {
             // Cible absente : le refus est explicite plutot que silencieux, sinon
@@ -277,7 +373,7 @@ impl World {
                     reason: AttackRefusal::NoSuchTarget,
                 },
             );
-            return;
+            return false;
         };
 
         let engagement = Engagement {
@@ -296,7 +392,7 @@ impl World {
                     reason: refusal_of(rejection),
                 },
             );
-            return;
+            return false;
         }
 
         let damage = resolve_attack(
@@ -307,7 +403,7 @@ impl World {
         );
 
         let Some(target) = state.entities.get_mut(&target_id) else {
-            return;
+            return false;
         };
         target.character = target.character.take_damage(damage);
         let remaining_health = target.character.vitals().current();
@@ -328,6 +424,7 @@ impl World {
         if died {
             Self::on_death(&mut state, attacker_id, target_id);
         }
+        true
     }
 
     /// Remet une entite en jeu a son point d'apparition.
@@ -372,9 +469,15 @@ impl World {
 
     /// Applique les consequences d'une mort : annonce et recompense.
     fn on_death(state: &mut State, killer_id: EntityId, victim_id: EntityId) {
-        let Some(victim) = state.entities.get(&victim_id) else {
+        let Some(victim) = state.entities.get_mut(&victim_id) else {
             return;
         };
+        // Une creature abattue demarre son compte a rebours de reapparition ; un
+        // joueur attend sa propre demande.
+        if let Some(brain) = victim.brain.as_mut() {
+            brain.died_at = Some(Instant::now());
+            brain.stance = Stance::Idle;
+        }
         let reward = experience_reward(victim.character.level());
 
         broadcast_around(
@@ -438,6 +541,296 @@ impl World {
         self.lock().entities.len()
     }
 
+    /// Fait apparaitre une creature a son poste.
+    ///
+    /// Les identifiants de creatures sont distincts de ceux des sessions : ils
+    /// viennent d'un compteur descendant, ce qui rend impossible qu'une creature
+    /// et un joueur partagent un identifiant, meme apres des milliers de
+    /// connexions.
+    pub fn spawn_creature(&self, id: EntityId, anchor: Position) {
+        let mut state = self.lock();
+        state.entities.insert(
+            id,
+            Entity {
+                position: anchor,
+                rule: MovementRule::walking(),
+                combat: CombatRule::melee(),
+                character: Character::create(
+                    CharacterId::new(id),
+                    creature_attributes(),
+                    ProgressionCurve::DEFAULT,
+                ),
+                outbox: None,
+                brain: Some(Brain {
+                    rule: AggroRule::standard(CombatRule::MELEE_RANGE_CM),
+                    anchor,
+                    stance: Stance::Idle,
+                    died_at: None,
+                    last_attack: None,
+                }),
+                visible: HashSet::new(),
+            },
+        );
+        state
+            .cells
+            .entry(self.grid.cell_of(anchor))
+            .or_default()
+            .insert(id);
+        self.refresh_visibility(&mut state, id);
+    }
+
+    /// Peuple la zone de depart.
+    ///
+    /// Les creatures sont espacees d'au moins **deux fois** leur rayon
+    /// d'agressivite : sinon en approcher une reveille toutes ses voisines, et un
+    /// personnage neuf se fait submerger sans avoir rien fait de maladroit. Ce
+    /// « reveil de groupe » involontaire est ce qui rend une zone de depart
+    /// injouable.
+    ///
+    /// Les identifiants descendent depuis `u64::MAX`, ceux des sessions montent
+    /// depuis 1 : les deux suites ne peuvent pas se croiser.
+    pub fn populate_starting_area(&self, count: u64) {
+        for index in 0..count {
+            let anchor = Position::new(
+                STARTING_AREA_ORIGIN.x + i32::try_from(index).unwrap_or(0) * CREATURE_SPACING_CM,
+                STARTING_AREA_ORIGIN.y,
+            );
+            self.spawn_creature(u64::MAX - index, anchor);
+        }
+    }
+
+    /// Avance la simulation d'un pas.
+    ///
+    /// Chaque creature percoit, decide et agit. Le pas de temps est passe en
+    /// parametre plutot que mesure ici : la simulation reste ainsi rejouable a
+    /// l'identique, et testable sans attendre.
+    pub fn tick(&self, step: Duration, now: Instant) {
+        let creatures: Vec<EntityId> = {
+            let state = self.lock();
+            state
+                .entities
+                .iter()
+                .filter(|(_, entity)| entity.brain.is_some())
+                .map(|(id, _)| *id)
+                .collect()
+        };
+
+        for id in creatures {
+            self.step_creature(id, step, now);
+        }
+    }
+
+    /// Fait agir une creature : reapparition, perception, decision, action.
+    fn step_creature(&self, id: EntityId, step: Duration, now: Instant) {
+        let elapsed_ms = u64::try_from(step.as_millis()).unwrap_or(u64::MAX);
+
+        let Some(Observation {
+            situation,
+            target,
+            alive,
+            died_at,
+        }) = self.observe(id)
+        else {
+            return;
+        };
+
+        if !alive {
+            // Reapparition differee : la creature reste au sol le temps que le
+            // joueur constate sa victoire, puis revient a son poste.
+            if died_at.is_some_and(|at| now.duration_since(at) >= CREATURE_RESPAWN_DELAY) {
+                self.revive_creature(id);
+            }
+            return;
+        }
+
+        let Some((intent, stance)) = self.decide(id, situation) else {
+            return;
+        };
+        if std::env::var("HWARANG_TRACE_AI").is_ok() {
+            eprintln!(
+                "[ia] {id} en ({},{}) poste ({},{}) cible={:?} posture={:?} -> {intent:?}",
+                situation.creature.x,
+                situation.creature.y,
+                situation.anchor.x,
+                situation.anchor.y,
+                situation.nearest.map(|t| (t.position.x, t.position.y)),
+                situation.stance,
+            );
+        }
+        self.remember_stance(id, stance);
+
+        match intent {
+            Intent::Hold => {}
+            Intent::Approach(target) | Intent::ReturnTo(target) => {
+                self.step_towards(id, target, elapsed_ms);
+            }
+            Intent::Strike => {
+                if let Some(target) = target {
+                    // Temps ecoule depuis la derniere attaque portee, et non
+                    // depuis le dernier pas de simulation : les deux different
+                    // d'un facteur cinq.
+                    let since = self.attack_clock(id, now);
+                    if self.request_attack(id, target, since) {
+                        self.mark_attack(id, now);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rassemble ce que la creature percoit.
+    fn observe(&self, id: EntityId) -> Option<Observation> {
+        let state = self.lock();
+        let entity = state.entities.get(&id)?;
+        let brain = entity.brain?;
+
+        // La cible est cherchee parmi les entites deja percues : la relation de
+        // visibilite est maintenue a chaque deplacement, la reparcourir ici
+        // reviendrait a refaire le travail de la grille.
+        //
+        // Son **identifiant** est retenu, pas seulement sa position : le joueur
+        // continue de bouger pendant que la creature reflechit, et le retrouver
+        // ensuite par comparaison de coordonnees echouerait des qu'il a fait un
+        // pas — la creature ne frapperait alors que des cibles immobiles.
+        let target = entity
+            .visible
+            .iter()
+            .filter(|other| {
+                state
+                    .entities
+                    .get(other)
+                    .is_some_and(|o| o.brain.is_none() && o.is_alive())
+            })
+            .min_by_key(|other| {
+                state
+                    .entities
+                    .get(other)
+                    .map_or(u64::MAX, |o| entity.position.distance_squared(o.position))
+            })
+            .copied();
+
+        let nearest = target
+            .and_then(|other| state.entities.get(&other))
+            .map(|other| Threat {
+                position: other.position,
+                alive: true,
+            });
+
+        Some(Observation {
+            situation: Situation {
+                creature: entity.position,
+                anchor: brain.anchor,
+                nearest,
+                stance: brain.stance,
+            },
+            target,
+            alive: entity.is_alive(),
+            died_at: brain.died_at,
+        })
+    }
+
+    fn decide(&self, id: EntityId, situation: Situation) -> Option<(Intent, Stance)> {
+        let state = self.lock();
+        let brain = state.entities.get(&id)?.brain?;
+        Some(brain.rule.decide(situation))
+    }
+
+    /// Temps depuis la derniere attaque **portee** de cette creature.
+    ///
+    /// Lecture seule, contrairement a l'horloge des connexions. Cote client, la
+    /// remise a zero est inconditionnelle pour qu'un joueur ne puisse pas
+    /// accumuler du temps a coups de tentatives refusees. Une creature tente sa
+    /// chance a chaque pas de simulation : lui appliquer la meme regle
+    /// remettrait son horloge a zero toutes les 200 ms, elle n'atteindrait
+    /// jamais sa cadence d'une seconde et resterait paralysee apres son premier
+    /// coup. Il n'y a rien a s'y proteger — c'est le serveur qui decide quand
+    /// elle frappe.
+    fn attack_clock(&self, id: EntityId, now: Instant) -> u64 {
+        let state = self.lock();
+        state
+            .entities
+            .get(&id)
+            .and_then(|entity| entity.brain)
+            .map_or(0, |brain| {
+                brain.last_attack.map_or(u64::MAX, |at| {
+                    u64::try_from(now.duration_since(at).as_millis()).unwrap_or(u64::MAX)
+                })
+            })
+    }
+
+    /// Enregistre qu'une creature vient de frapper.
+    fn mark_attack(&self, id: EntityId, now: Instant) {
+        let mut state = self.lock();
+        if let Some(brain) = state.entities.get_mut(&id).and_then(|e| e.brain.as_mut()) {
+            brain.last_attack = Some(now);
+        }
+    }
+
+    fn remember_stance(&self, id: EntityId, stance: Stance) {
+        let mut state = self.lock();
+        if let Some(brain) = state.entities.get_mut(&id).and_then(|e| e.brain.as_mut()) {
+            brain.stance = stance;
+        }
+    }
+
+    /// Avance d'un pas vers un point, sans jamais depasser sa propre vitesse.
+    ///
+    /// Passe par `request_move`, donc par la meme validation que les joueurs :
+    /// une creature qui se teleporterait serait un bug invisible en test unitaire
+    /// mais flagrant a l'ecran.
+    fn step_towards(&self, id: EntityId, target: Position, elapsed_ms: u64) {
+        let Some((from, allowance)) = ({
+            let state = self.lock();
+            state
+                .entities
+                .get(&id)
+                .map(|entity| (entity.position, entity.rule.allowance_cm(elapsed_ms)))
+        }) else {
+            return;
+        };
+
+        let step = advance(from, target, allowance);
+        if step != from {
+            self.request_move(id, step.x, step.y, elapsed_ms);
+        }
+    }
+
+    /// Remet une creature morte a son poste, en pleine sante.
+    fn revive_creature(&self, id: EntityId) {
+        let mut state = self.lock();
+        let Some(entity) = state.entities.get(&id) else {
+            return;
+        };
+        let Some(brain) = entity.brain else { return };
+        let from = entity.position;
+        let anchor = brain.anchor;
+
+        let Some(entity) = state.entities.get_mut(&id) else {
+            return;
+        };
+        entity.character = entity.character.respawn();
+        entity.position = anchor;
+        if let Some(brain) = entity.brain.as_mut() {
+            brain.stance = Stance::Idle;
+            brain.died_at = None;
+        }
+        let health = entity.character.vitals().current();
+
+        self.reindex(&mut state, id, from, anchor);
+        broadcast_around(
+            &state,
+            id,
+            id,
+            ServerMessage::EntityRespawned {
+                entity: id,
+                x: anchor.x,
+                y: anchor.y,
+                health,
+            },
+        );
+        self.refresh_visibility(&mut state, id);
+    }
+
     /// Etat courant d'une entite, pour la sauvegarde.
     ///
     /// Lecture instantanee sous verrou : l'ecriture en base se fait ensuite,
@@ -460,6 +853,7 @@ impl World {
             return;
         };
         let position = subject.position;
+        let subject_kind = subject.kind();
         let previously_visible = subject.visible.clone();
 
         let mut examined: HashSet<EntityId> = previously_visible.clone();
@@ -480,9 +874,10 @@ impl World {
 
             match (visible_before, visible_now) {
                 (false, true) => {
+                    let (other_kind, own_kind) = (candidate.kind(), subject_kind);
                     link(state, id, other);
-                    send(state, id, appeared(other, other_position));
-                    send(state, other, appeared(id, position));
+                    send(state, id, appeared(other, other_kind, other_position));
+                    send(state, other, appeared(id, own_kind, position));
                 }
                 (true, false) => {
                     unlink(state, id, other);
@@ -504,9 +899,10 @@ impl World {
     }
 }
 
-const fn appeared(entity_id: EntityId, position: Position) -> ServerMessage {
+const fn appeared(entity_id: EntityId, kind: EntityKind, position: Position) -> ServerMessage {
     ServerMessage::EntityAppeared {
         entity_id,
+        kind,
         x: position.x,
         y: position.y,
     }
@@ -575,10 +971,16 @@ fn broadcast_around(state: &State, first: EntityId, second: EntityId, message: S
 /// Un envoi qui echoue parce que le recepteur a disparu signifie que la
 /// connexion est deja fermee ; le retrait viendra de la tache de lecture.
 fn send(state: &State, id: EntityId, message: ServerMessage) {
-    let Some(entity) = state.entities.get(&id) else {
+    // Une creature n'a pas de canal : elle n'a personne a prevenir. Les
+    // notifications la concernant partent vers ses temoins, pas vers elle.
+    let Some(outbox) = state
+        .entities
+        .get(&id)
+        .and_then(|entity| entity.outbox.as_ref())
+    else {
         return;
     };
-    if let Err(TrySendError::Full(dropped)) = entity.outbox.try_send(message) {
+    if let Err(TrySendError::Full(dropped)) = outbox.try_send(message) {
         eprintln!("entite {id} ne draine plus sa file, message perdu : {dropped:?}");
     }
 }
@@ -823,6 +1225,372 @@ mod tests {
         assert!(
             queued <= OUTBOX_CAPACITY,
             "{queued} messages en file pour un plafond de {OUTBOX_CAPACITY}"
+        );
+    }
+
+    // --- Creatures ---
+
+    const CREATURE: EntityId = u64::MAX;
+    const STEP: Duration = Duration::from_millis(200);
+
+    fn creature_position(world: &World) -> Position {
+        world.lock().entities[&CREATURE].position
+    }
+
+    fn creature_stance(world: &World) -> Stance {
+        world.lock().entities[&CREATURE]
+            .brain
+            .map_or(Stance::Idle, |brain| brain.stance)
+    }
+
+    /// Avance la simulation de `rounds` pas.
+    fn run_ticks(world: &World, rounds: usize) {
+        for _ in 0..rounds {
+            world.tick(STEP, Instant::now());
+        }
+    }
+
+    #[test]
+    fn une_creature_immobile_reste_a_son_poste() {
+        let world = World::new();
+        let post = Position::new(5_000, 5_000);
+        world.spawn_creature(CREATURE, post);
+
+        run_ticks(&world, 10);
+
+        assert_eq!(creature_position(&world), post);
+        assert_eq!(creature_stance(&world), Stance::Idle);
+    }
+
+    #[test]
+    fn une_creature_est_annoncee_comme_telle_et_non_comme_un_joueur() {
+        let world = World::new();
+        world.spawn_creature(CREATURE, spawn_position(1));
+        let mut player = join(&world, 1);
+
+        let kinds: Vec<EntityKind> = drain(&mut player)
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::EntityAppeared { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec![EntityKind::Creature]);
+    }
+
+    #[test]
+    fn une_creature_poursuit_un_joueur_a_portee_de_detection() {
+        let world = World::new();
+        let post = spawn_position(1);
+        world.spawn_creature(CREATURE, Position::new(post.x + 1_000, post.y));
+        let _player = join(&world, 1);
+
+        let before = creature_position(&world);
+        run_ticks(&world, 3);
+        let after = creature_position(&world);
+
+        assert_ne!(after, before, "la creature n'a pas bouge");
+        assert!(
+            after.distance_squared(post) < before.distance_squared(post),
+            "elle ne s'est pas rapprochee du joueur"
+        );
+        assert_eq!(creature_stance(&world), Stance::Engaged);
+    }
+
+    #[test]
+    fn une_creature_ignore_un_joueur_hors_de_portee() {
+        let world = World::new();
+        let far = Position::new(500_000, 500_000);
+        world.spawn_creature(CREATURE, far);
+        let _player = join(&world, 1);
+
+        run_ticks(&world, 5);
+
+        assert_eq!(creature_position(&world), far);
+        assert_eq!(creature_stance(&world), Stance::Idle);
+    }
+
+    #[test]
+    fn une_creature_ne_se_teleporte_pas_vers_sa_cible() {
+        // Elle passe par la meme validation de vitesse que les joueurs : un pas
+        // de creature ne peut pas depasser ce qu'un pas de joueur pourrait faire.
+        let world = World::new();
+        let post = spawn_position(1);
+        world.spawn_creature(CREATURE, Position::new(post.x + 1_200, post.y));
+        let _player = join(&world, 1);
+
+        let before = creature_position(&world);
+        world.tick(STEP, Instant::now());
+        let travelled = before.distance_squared(creature_position(&world)).isqrt();
+
+        let allowance = MovementRule::walking().allowance_cm(200);
+        assert!(
+            travelled <= allowance,
+            "{travelled} cm parcourus pour {allowance} autorises"
+        );
+    }
+
+    #[test]
+    fn une_creature_attaque_le_joueur_qu_elle_a_rejoint() {
+        let world = World::new();
+        let post = spawn_position(1);
+        world.spawn_creature(CREATURE, Position::new(post.x + 150, post.y));
+        let mut player = join(&world, 1);
+        drain(&mut player);
+
+        run_ticks(&world, 3);
+
+        assert!(
+            drain(&mut player).iter().any(|m| matches!(
+                m,
+                ServerMessage::DamageDealt {
+                    attacker: CREATURE,
+                    ..
+                }
+            )),
+            "la creature au contact n'a jamais frappe"
+        );
+    }
+
+    #[test]
+    fn une_creature_au_contact_frappe_a_sa_cadence_et_pas_une_seule_fois() {
+        // Regression. La creature tente sa chance a chaque pas de 200 ms ; si son
+        // horloge repartait a chaque tentative — comme celle d'une connexion, ou
+        // c'est une protection contre l'accumulation — l'ecoule ne depasserait
+        // jamais la cadence d'une seconde, et elle resterait paralysee apres son
+        // premier coup. Le symptome est une creature qui suit le joueur sans
+        // jamais le toucher.
+        let world = World::new();
+        let post = spawn_position(1);
+        world.spawn_creature(CREATURE, Position::new(post.x + 150, post.y));
+        let mut player = join(&world, 1);
+        drain(&mut player);
+
+        // Cinq secondes de simulation, horodatees explicitement : le test ne
+        // dure pas cinq secondes pour autant.
+        let start = Instant::now();
+        for step in 0..25 {
+            world.tick(STEP, start + STEP * step);
+        }
+
+        let blows = drain(&mut player)
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    ServerMessage::DamageDealt {
+                        attacker: CREATURE,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            blows >= 3,
+            "{blows} coup(s) en 5 s simulees pour une cadence d'une seconde"
+        );
+    }
+
+    #[test]
+    fn une_creature_ne_depasse_pas_sa_cadence_malgre_les_pas_rapides() {
+        // L'autre bord du meme reglage : cinq tentatives par seconde ne doivent
+        // pas produire cinq coups.
+        let world = World::new();
+        let post = spawn_position(1);
+        world.spawn_creature(CREATURE, Position::new(post.x + 150, post.y));
+        let mut player = join(&world, 1);
+        drain(&mut player);
+
+        let start = Instant::now();
+        for step in 0..15 {
+            world.tick(STEP, start + STEP * step);
+        }
+
+        let blows = drain(&mut player)
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    ServerMessage::DamageDealt {
+                        attacker: CREATURE,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            blows <= 4,
+            "{blows} coups en 3 s simulees : la cadence n'est pas respectee"
+        );
+    }
+
+    #[test]
+    fn une_creature_rentre_a_son_poste_quand_le_joueur_disparait() {
+        let world = World::new();
+        let post = spawn_position(1);
+        world.spawn_creature(CREATURE, Position::new(post.x + 1_000, post.y));
+        let _player = join(&world, 1);
+
+        run_ticks(&world, 3);
+        assert_eq!(creature_stance(&world), Stance::Engaged);
+
+        world.leave(1);
+        run_ticks(&world, 40);
+
+        assert_eq!(
+            creature_position(&world),
+            Position::new(post.x + 1_000, post.y),
+            "la creature n'est pas rentree"
+        );
+        assert_eq!(creature_stance(&world), Stance::Idle);
+    }
+
+    #[test]
+    fn une_creature_abattue_ne_revient_pas_immediatement() {
+        let world = World::new();
+        world.spawn_creature(CREATURE, spawn_position(1));
+        let _player = join(&world, 1);
+        strike_until_dead(&world, 1, CREATURE);
+
+        run_ticks(&world, 5);
+
+        assert!(
+            !world.lock().entities[&CREATURE].is_alive(),
+            "elle est revenue avant son delai"
+        );
+    }
+
+    #[test]
+    fn une_creature_abattue_revient_a_son_poste_le_delai_passe() {
+        let world = World::new();
+        let post = spawn_position(1);
+        world.spawn_creature(CREATURE, post);
+        let mut player = join(&world, 1);
+        strike_until_dead(&world, 1, CREATURE);
+        drain(&mut player);
+
+        // Le temps est fourni a `tick`, jamais lu par lui : la reapparition se
+        // teste sans attendre dix secondes.
+        let later = Instant::now() + CREATURE_RESPAWN_DELAY;
+        world.tick(STEP, later);
+
+        let entity = &world.lock().entities[&CREATURE];
+        assert!(entity.is_alive(), "elle n'est pas revenue");
+        assert_eq!(entity.position, post);
+        assert!(
+            drain(&mut player).iter().any(|m| matches!(
+                m,
+                ServerMessage::EntityRespawned {
+                    entity: CREATURE,
+                    ..
+                }
+            )),
+            "le joueur n'a pas ete prevenu du retour"
+        );
+    }
+
+    #[test]
+    fn une_creature_n_attaque_pas_une_autre_creature() {
+        let world = World::new();
+        world.spawn_creature(CREATURE, Position::new(1_000, 0));
+        world.spawn_creature(CREATURE - 1, Position::new(1_100, 0));
+
+        run_ticks(&world, 5);
+
+        for id in [CREATURE, CREATURE - 1] {
+            let entity = &world.lock().entities[&id];
+            assert_eq!(
+                entity.character.vitals().current(),
+                entity.character.vitals().max(),
+                "l'entite {id} a ete blessee"
+            );
+        }
+    }
+
+    #[test]
+    fn aucune_position_ne_reveille_deux_creatures_a_la_fois() {
+        // La contrainte qui rend la zone de depart jouable : un personnage neuf
+        // ne doit jamais se retrouver a affronter deux creatures pour s'etre
+        // approche d'une seule.
+        let world = World::new();
+        world.populate_starting_area(6);
+
+        let posts: Vec<Position> = world
+            .lock()
+            .entities
+            .values()
+            .filter_map(|entity| entity.brain.map(|brain| brain.anchor))
+            .collect();
+        let aggro = AggroRule::standard(CombatRule::MELEE_RANGE_CM).aggro_radius_cm();
+
+        for (index, first) in posts.iter().enumerate() {
+            for second in posts.iter().skip(index + 1) {
+                let gap = first.distance_squared(*second).isqrt();
+                assert!(
+                    gap > u64::from(aggro) * 2,
+                    "deux postes distants de {gap} cm pour un rayon de {aggro}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn les_creatures_apparaissent_loin_du_point_d_apparition_des_joueurs() {
+        // Elles doivent etre cherchees, pas rencontrees a la connexion.
+        let world = World::new();
+        world.populate_starting_area(6);
+        let aggro = AggroRule::standard(CombatRule::MELEE_RANGE_CM).aggro_radius_cm();
+
+        let posts: Vec<Position> = world
+            .lock()
+            .entities
+            .values()
+            .filter_map(|entity| entity.brain.map(|brain| brain.anchor))
+            .collect();
+
+        for slot in 0..64 {
+            let spawn = spawn_position(slot);
+            for post in &posts {
+                assert!(
+                    !spawn.is_within(*post, aggro),
+                    "l'emplacement {slot} nait dans le rayon d'une creature"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn les_creatures_ne_comptent_pas_comme_des_joueurs_connectes() {
+        let world = World::new();
+        world.spawn_creature(CREATURE, Position::ORIGIN);
+        // `population` sert au journal d'exploitation : y melanger les creatures
+        // rendrait le nombre de connectes illisible.
+        assert_eq!(world.population(), 1);
+    }
+
+    #[test]
+    fn un_pas_vers_une_cible_proche_l_atteint_sans_la_depasser() {
+        let from = Position::new(100, 100);
+        let target = Position::new(150, 100);
+        assert_eq!(advance(from, target, 1_000), target);
+    }
+
+    #[test]
+    fn un_pas_vers_une_cible_lointaine_respecte_l_allocation() {
+        let from = Position::ORIGIN;
+        let target = Position::new(10_000, 0);
+        let step = advance(from, target, 300);
+        assert_eq!(step, Position::new(300, 0));
+    }
+
+    #[test]
+    fn un_pas_en_diagonale_ne_depasse_pas_l_allocation() {
+        let from = Position::ORIGIN;
+        let target = Position::new(10_000, 10_000);
+        let step = advance(from, target, 300);
+        assert!(
+            from.distance_squared(step).isqrt() <= 300,
+            "{step:?} depasse l'allocation"
         );
     }
 

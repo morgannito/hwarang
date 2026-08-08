@@ -16,7 +16,7 @@ import sys
 import time
 
 # Doit suivre PROTOCOL_VERSION cote Rust.
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
 HANDSHAKE, PING, ENTER_WORLD, MOVE = 0x01, 0x02, 0x03, 0x04
 REGISTER = 0x07
@@ -131,9 +131,16 @@ class Client:
         self.sock.close()
 
 
+KINDS = {1: "joueur", 2: "creature"}
+
+
 def describe(opcode: int, payload: bytes) -> str:
     name = NAMES.get(opcode, f"opcode 0x{opcode:02x}")
-    if opcode in (WORLD_ENTERED, ENTITY_APPEARED, ENTITY_MOVED):
+    if opcode == ENTITY_APPEARED:
+        # Depuis la v5, l'apparition porte la nature de l'entite.
+        entity_id, kind, x, y = struct.unpack(">QBii", payload)
+        return f"{name} entite={entity_id} ({KINDS.get(kind, '?')}) ({x}, {y})"
+    if opcode in (WORLD_ENTERED, ENTITY_MOVED):
         entity_id, x, y = struct.unpack(">Qii", payload)
         return f"{name} entite={entity_id} ({x}, {y})"
     if opcode == ENTITY_VANISHED:

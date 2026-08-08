@@ -35,6 +35,21 @@ un mot de passe faux donnent la même erreur, après le même temps de calcul �
 sinon l'écart suffit à énumérer les comptes du serveur.
 **Démo :** `scripts/persistence.py`, en deux phases autour d'un redémarrage.
 
+### J5 — Monde peuplé
+Créatures autonomes et boucle de simulation à pas fixe. Jusqu'ici tout était
+piloté par les messages entrants ; une créature agit sans que personne ne parle.
+
+La règle d'agressivité vit dans le domaine et ne décide que d'une **intention** :
+elle ne manipule aucun identifiant et ne déplace rien. La laisse se mesure depuis
+le **poste** de la créature, jamais depuis sa cible — sinon un joueur traîne un
+troupeau à travers la carte pour le déposer sur quelqu'un d'autre.
+
+Les postes sont espacés d'au moins deux fois le rayon d'agressivité : en
+approcher un ne doit jamais en réveiller deux. Sans cette contrainte, un
+personnage neuf se fait submerger sans avoir rien fait de maladroit — constaté
+en jouant la démonstration, pas en relisant le code.
+**Démo :** `scripts/creatures.py`
+
 ---
 
 ## Phase 1 — Faire du serveur un jeu
@@ -55,17 +70,6 @@ voit ; un client bricolé pour tricher se fait replacer visiblement.
 
 **Inconnue non levée :** lire du binaire big-endian depuis GDScript
 (`PackedByteArray`, lectures partielles). Non vérifié à ce jour.
-
-### J5 — Monde peuplé · **grand**
-
-- entités non joueuses, machine à états d'IA (inactif → poursuite → combat →
-  retour), table d'agression
-- zones d'apparition, réapparition différée
-- boucle de simulation à pas fixe : jusqu'ici tout est piloté par les messages
-  entrants, un monstre doit agir sans que personne ne parle
-
-**Fini quand :** un joueur peut affronter un monstre qui riposte, mourir, et
-revenir.
 
 ### J6 — Objets · **grand**
 
@@ -102,9 +106,8 @@ Un MMO solo n'échoue pas sur un obstacle technique, il s'arrête par lassitude
 pendant la phase de contenu — celle qui n'a pas de fin et où chaque heure
 produit un résultat plus petit que la précédente.
 
-D'où l'ordre choisi ici : à la fin de J3, le projet est déjà une démonstration
-technique montrable. À la fin de J5, c'est un jeu jouable, même laid. Tout ce
-qui vient après ajoute de la matière, pas des fondations.
+D'où l'ordre choisi ici : le serveur est désormais un jeu jouable, même sans
+image. Tout ce qui vient après ajoute de la matière, pas des fondations.
 
 ---
 
