@@ -92,6 +92,10 @@ Ce qui marche aujourd'hui : deux clients se connectent, se découvrent, se voien
 bouger en temps réel, disparaissent l'un de l'autre en sortant du champ de
 vision, et un déplacement impossible est refusé puis corrigé par le serveur.
 
+## Suite
+
+[Roadmap](docs/ROADMAP.md) — jalons, et les deux murs qui ne sont pas techniques.
+
 ## Décisions d'architecture
 
 - [ADR-0001 — Réécriture intégrale, aucun code propriétaire](docs/adr/0001-reecriture-integrale.md)
