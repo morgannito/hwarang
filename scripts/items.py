@@ -188,6 +188,33 @@ def kill(player: Client, target: int) -> int:
     raise AssertionError("la creature n'est jamais tombee")
 
 
+def strike_once(player: Client, target: int) -> int:
+    """Porte un seul coup et retourne les degats infliges.
+
+    Comparer l'armement ne demande pas d'abattre l'adversaire : un coup suffit,
+    et l'echange complet exposerait la mesure a la survie du joueur — sur une
+    machine lente, le combat dure plus longtemps et il encaisse davantage.
+    """
+    for _ in range(20):
+        time.sleep(COOLDOWN)
+        player.send(ATTACK, struct.pack(">Q", target))
+        for opcode, payload in player.drain(timeout=0.3):
+            if opcode == DAMAGE_DEALT:
+                attacker, _, damage, _ = struct.unpack(">QQII", payload)
+                if attacker == player.entity_id:
+                    return damage
+            elif opcode == ATTACK_REFUSED and payload[0] == 1 and target in player.seen:
+                player.walk_towards(player.seen[target][1], within=MELEE_RANGE_CM // 2)
+            elif opcode == ATTACK_REFUSED and payload[0] == 3:
+                # L'attaquant est a terre : il se releve et repart au contact.
+                player.send(RESPAWN)
+                time.sleep(0.4)
+                player.drain()
+                if target in player.seen:
+                    player.walk_towards(player.seen[target][1], within=MELEE_RANGE_CM // 2)
+    raise AssertionError("aucun coup n'a porte")
+
+
 def await_respawn(player: Client, target: int, delay: float) -> tuple[int, int]:
     """Attend qu'une creature abattue revienne, et donne son poste.
 
@@ -220,7 +247,8 @@ def phase1(host: str, port: int) -> int:
 
     print("\n1. Il abat une creature et ramasse ce qu'elle laisse")
     target, _ = find_creature(player)
-    before = kill(player, target)
+    before = strike_once(player, target)
+    kill(player, target)
     player.drain(timeout=0.5)
     assert player.bag, "aucun butin recu"
     index, item = next(iter(player.bag.items()))
@@ -240,7 +268,7 @@ def phase1(host: str, port: int) -> int:
     post = await_respawn(player, target, RESPAWN_DELAY)
     player.walk_towards(post, within=MELEE_RANGE_CM // 2)
     player.drain()
-    after = kill(player, target)
+    after = strike_once(player, target)
     print(f"  degats equipe : {after} (contre {before} a mains nues)")
     assert after > before, "l'equipement n'a rien change aux degats"
 
